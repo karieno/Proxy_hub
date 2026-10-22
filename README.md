@@ -173,4 +173,5 @@ tg://webproxy?server=1.2.3.4&secret=...
 ## Благодарность
 
 Белый список чекер частично основан на проекте:
-- @Aleksey-Kon/white-list-test
+[- Aleksey-Kon/white-list-test
+](https://github.com/Aleksey-Kon/white-list-test)
