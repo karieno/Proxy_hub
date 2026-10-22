@@ -1,0 +1,4063 @@
+__id__ = "proxy_hub"
+__name__ = "Proxy Hub"
+__description__ = "Всё для прокси в одном плагине: автосбор из Telegram-каналов и веб-источников, автопилот «всё одной кнопкой», импорт/экспорт, очистка, и многое другое."
+__author__ = "@angelnkake | Claude"
+__version__ = "1.1.0"
+__icon__ = "UtyaDuck/31"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+
+import base64
+import binascii
+import json
+import os
+import re
+import socket
+import threading
+import time
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, List
+
+import java
+from java import jarray, jclass, jint
+
+from android.os import SystemClock
+from android_utils import OnClickListener, log, run_on_ui_thread
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
+from client_utils import (
+    get_last_fragment,
+    get_user_config,
+    run_on_queue,
+    send_document,
+    send_message,
+    send_request,
+)
+from file_utils import get_plugins_dir, write_file
+from hook_utils import find_class, get_private_field
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import (
+    Custom,
+    Divider,
+    EditText,
+    Header,
+    Input,
+    Selector,
+    SimpleSettingFactory,
+    Switch,
+    Text,
+)
+
+from org.telegram.messenger import (
+    AndroidUtilities,
+    ApplicationLoader,
+    MessagesController,
+    NotificationCenter,
+    R as R_tg,
+    SharedConfig,
+    UserConfig,
+)
+from org.telegram.tgnet import ConnectionsManager, RequestTimeDelegate, TLRPC
+from org.telegram.ui.ActionBar import Theme
+
+# ════════════════════════════════════════════════════════════════════
+#  Константы
+# ════════════════════════════════════════════════════════════════════
+
+TAG = "[ProxyHub]"
+_PLUGIN = None  # ссылка на экземпляр плагина для view-фабрик
+
+STICKER_SET = "UtyaDuck"
+STICKER_INDEX = 31
+
+BRAND = "#F59E0B"
+BRAND_2 = "#FFD54A"
+HEADER_TEXT = "#2B1F00"
+
+INTERVAL_LABELS = ["15 минут", "30 минут", "1 час", "3 часа", "6 часов", "12 часов", "24 часа", "Свой"]
+INTERVAL_MINUTES = [15, 30, 60, 180, 360, 720, 1440, None]
+DEFAULT_INTERVAL_IDX = 6
+
+PROXY_LINK_RE = re.compile(
+    r"(?:tg://|https?://(?:t\.me|telegram\.me)/)(?:proxy|socks|webproxy)\?[^\s<>\"'\)\]]+",
+    re.IGNORECASE,
+)
+
+MENU_PING_ID = 999_001
+MENU_SORT_ID = 999_002
+MENU_IMPORT_ID = 999_003
+MENU_EXPORT_ID = 999_004
+
+TAB_SOURCES, TAB_TIMER, TAB_TOOLS, TAB_VIEW, TAB_WL = 0, 1, 2, 3, 4
+TAB_PROXY_LIST = 5
+
+
+def _log(msg):
+    try:
+        log(f"{TAG} {msg}")
+    except Exception:
+        pass
+
+
+def _dp(v):
+    return AndroidUtilities.dp(v)
+
+
+def _color(hex_str):
+    return jclass("android.graphics.Color").parseColor(hex_str)
+
+
+def _safe_get(obj, key, default=None):
+    if obj is None:
+        return default
+    try:
+        val = obj.get(key)
+        if val is not None:
+            return val
+    except Exception:
+        pass
+    return default
+
+
+def _jlist(jl) -> list:
+    return [jl.get(i) for i in range(jl.size())]
+
+
+def _fmt_time(ts):
+    try:
+        ts = float(ts)
+        if ts <= 0:
+            return "ещё не было"
+        return time.strftime("%d.%m %H:%M", time.localtime(ts))
+    except Exception:
+        return "—"
+
+
+def _fmt_left(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return "меньше минуты"
+    m = seconds // 60
+    if m < 60:
+        return f"{m} мин"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h} ч {m} мин" if m else f"{h} ч"
+    d, h = divmod(h, 24)
+    return f"{d} д {h} ч" if h else f"{d} д"
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Работа с прокси 
+# ════════════════════════════════════════════════════════════════════
+
+def _info_fields(p):
+    """Возвращает (addr, port, secret, user, password) для ProxyInfo любой версии."""
+    try:
+        return (
+            str(p.address or ""),
+            int(p.port or 0),
+            str(p.secret or ""),
+            str(p.username or ""),
+            str(p.password or ""),
+        )
+    except Exception:
+        pass
+    try:
+        s = p.settings
+        return (
+            str(s.getAddress() or ""),
+            int(s.getPort() or 0),
+            str(s.getSecret() or ""),
+            "",
+            "",
+        )
+    except Exception:
+        return ("", 0, "", "", "")
+
+
+def _proxy_key(addr, port, secret):
+    return f"{addr}:{port}:{secret}"
+
+
+def _proxy_list_snapshot():
+    try:
+        SharedConfig.loadProxyList()
+    except Exception:
+        pass
+    try:
+        return _jlist(SharedConfig.proxyList)
+    except Exception:
+        return []
+
+
+def _notify_proxies_changed():
+    def _do():
+        nc = NotificationCenter.getGlobalInstance()
+        try:
+            nc.postNotificationName(NotificationCenter.proxySettingsChanged)
+            return
+        except Exception:
+            pass
+        try:
+            from java.lang import Object
+            nc.postNotificationName(NotificationCenter.proxySettingsChanged, jarray(Object)(0))
+        except Exception:
+            pass
+
+    run_on_ui_thread(_do)
+
+
+def _save_proxies():
+    try:
+        SharedConfig.saveProxyList()
+    except Exception as e:
+        _log(f"saveProxyList: {e}")
+
+
+def _proxy_count():
+    try:
+        return int(SharedConfig.proxyList.size())
+    except Exception:
+        return len(_proxy_list_snapshot())
+
+
+def _delete_one(p):
+    owners = [(SharedConfig, "deleteProxy")]
+    try:
+        PC = jclass("com.exteragram.messenger.proxy.ProxyController").getInstance()
+        owners += [(PC, "deleteProxy"), (PC, "removeProxy")]
+    except Exception:
+        pass
+    for owner, name in owners:
+        try:
+            getattr(owner, name)(p)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _delete_proxies(proxies):
+    """Удаляет прокси и проверяет по размеру списка, что они реально пропали.
+    Возвращает число удалённых."""
+    proxies = list(proxies)
+    if not proxies:
+        return 0
+    before = _proxy_count()
+    for p in proxies:
+        _delete_one(p)
+    after = _proxy_count()
+    if before - after < len(proxies):
+        # запасной путь: убираем объекты прямо из списка
+        try:
+            lst = SharedConfig.proxyList
+            for p in proxies:
+                try:
+                    lst.remove(p)
+                except Exception:
+                    pass
+        except Exception as e:
+            _log(f"fallback delete: {e}")
+        after = _proxy_count()
+    _save_proxies()
+    return max(0, before - after)
+
+
+def _new_proxy_info(server, port, user, pwd, secret, scheme="proxy"):
+    """Создаёт ProxyInfo. Сначала старый конструктор, затем ProxySettings (новые сборки)."""
+    ProxyInfo = jclass("org.telegram.messenger.SharedConfig$ProxyInfo")
+    try:
+        return ProxyInfo(server, int(port), user or "", pwd or "", secret or "")
+    except Exception:
+        pass
+    Uri = jclass("android.net.Uri")
+    PS = jclass("org.telegram.utils.proxy.ProxySettings")
+    uri = f"tg://{scheme}?server={server}&port={port}"
+    if secret:
+        uri += f"&secret={secret}"
+    if user:
+        uri += f"&user={user}"
+    if pwd:
+        uri += f"&pass={pwd}"
+    ps = PS.fromUri(Uri.parse(uri))
+    return ProxyInfo(ps) if ps is not None else None
+
+
+def _add_proxy_object(info):
+    try:
+        SharedConfig.addProxy(info)
+        return True
+    except Exception:
+        pass
+    try:
+        PC = jclass("com.exteragram.messenger.proxy.ProxyController").getInstance()
+        PC.addProxy(info)
+        return True
+    except Exception as e:
+        _log(f"addProxy failed: {e}")
+        return False
+
+
+def _add_web_proxy(url):
+    try:
+        Uri = jclass("android.net.Uri")
+        PS = jclass("org.telegram.utils.proxy.ProxySettings")
+        ProxyInfo = jclass("org.telegram.messenger.SharedConfig$ProxyInfo")
+        PC = jclass("com.exteragram.messenger.proxy.ProxyController").getInstance()
+        ps = PS.fromUri(Uri.parse(url))
+        if ps is None:
+            return False
+        PC.addProxy(ProxyInfo(ps))
+        return True
+    except Exception as e:
+        _log(f"webproxy add failed: {e}")
+        return False
+
+
+def _add_link(url, seen):
+    """Добавляет прокси по ссылке. Возвращает 'added' | 'dup' | 'bad'."""
+    u = url.replace("&amp;", "&").strip().rstrip(".,;")
+    u = re.sub(r"^https?://(?:t\.me|telegram\.me)/", "tg://", u, flags=re.IGNORECASE)
+    low = u.lower()
+    try:
+        parsed = urllib.parse.urlparse(u)
+        q = urllib.parse.parse_qs(parsed.query)
+    except Exception:
+        return "bad"
+
+    server = q.get("server", [""])[0]
+    if not server:
+        return "bad"
+    secret = q.get("secret", [""])[0]
+
+    if low.startswith("tg://webproxy"):
+        key = f"web:{server}:{secret}"
+        if key in seen:
+            return "dup"
+        if _add_web_proxy(u):
+            seen.add(key)
+            return "added"
+        return "bad"
+
+    port_str = q.get("port", ["0"])[0]
+    if not port_str.isdigit() or int(port_str) <= 0:
+        return "bad"
+    port = int(port_str)
+    key = _proxy_key(server, port, secret)
+    if key in seen:
+        return "dup"
+    user = urllib.parse.unquote(q.get("user", [""])[0])
+    pwd = urllib.parse.unquote(q.get("pass", [""])[0])
+    scheme = "socks" if low.startswith("tg://socks") else "proxy"
+    info = _new_proxy_info(server, port, user, pwd, secret, scheme)
+    if info is None or not _add_proxy_object(info):
+        return "bad"
+    seen.add(key)
+    return "added"
+
+
+def _existing_keys():
+    keys = set()
+    for p in _proxy_list_snapshot():
+        a, po, s, _, _ = _info_fields(p)
+        keys.add(_proxy_key(a, po, s))
+    return keys
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Разбор источников
+# ════════════════════════════════════════════════════════════════════
+
+def parse_source(line):
+    """
+    Поддерживаемые форматы (по одному в строке):
+      @channel
+      https://t.me/channel
+      t.me/channel topic=5          (топик форума)
+      https://t.me/c/1234567890     (приватный канал, где вы состоите)
+      dialog:-1001234567890[:topic] (служебный, ставится из меню чата)
+    """
+    s = (line or "").strip()
+    if not s or s.startswith("#"):
+        return None
+    topic = 0
+    m = re.search(r"topic[=:]\s*(\d+)", s, re.IGNORECASE)
+    if m:
+        topic = int(m.group(1))
+
+    m = re.match(r"^dialog:(-?\d+)(?::(\d+))?$", s)
+    if m:
+        t = int(m.group(2) or 0)
+        return {"kind": "dialog", "id": int(m.group(1)), "topic": t, "key": f"dialog:{m.group(1)}:{t}"}
+
+    m = re.search(r"(?:t\.me|telegram\.me)/c/(\d+)", s, re.IGNORECASE)
+    if m:
+        did = -(1000000000000 + int(m.group(1)))
+        return {"kind": "dialog", "id": did, "topic": topic, "key": f"dialog:{did}:{topic}"}
+
+    m = re.search(r"(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,})", s, re.IGNORECASE)
+    if not m:
+        m = re.match(r"^@?([A-Za-z][A-Za-z0-9_]{3,})(?:\s|$)", s)
+    if m:
+        name = m.group(1)
+        if name.lower() in ("proxy", "socks", "joinchat", "addstickers", "c", "s"):
+            return None
+        return {"kind": "username", "name": name, "topic": topic, "key": f"@{name.lower()}:{topic}"}
+    return None
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Парсер веб-источников
+# ════════════════════════════════════════════════════════════════════
+
+WEB_MAX_BYTES = 5_000_000
+
+
+def normalize_web_url(line):
+    """Приводит строку к ссылке для скачивания. Возвращает None, если не похоже на URL."""
+    s = (line or "").strip()
+    if not s or s.startswith("#"):
+        return None
+    s = s.split()[0]
+    if not re.match(r"^https?://", s, re.IGNORECASE):
+        if re.match(r"^(github\.com|gist\.github\.com|raw\.githubusercontent\.com|gitverse\.ru|[\w.-]+\.[a-z]{2,})/", s, re.IGNORECASE):
+            s = "https://" + s
+        else:
+            return None
+    # github blob -> raw
+    m = re.match(r"^https?://github\.com/([^/]+)/([^/]+)/blob/(.+)$", s, re.IGNORECASE)
+    if m:
+        return f"https://raw.githubusercontent.com/{m.group(1)}/{m.group(2)}/{m.group(3)}"
+    # публичный канал t.me/name -> веб-превью t.me/s/name (читается без входа)
+    m = re.match(r"^https?://(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,})/?$", s, re.IGNORECASE)
+    if m and m.group(1).lower() not in ("proxy", "socks", "joinchat", "s", "c"):
+        return f"https://t.me/s/{m.group(1)}"
+    return s
+
+
+def _links_from_json(node, out=None, depth=0):
+    out = [] if out is None else out
+    if depth > 6:
+        return out
+    if isinstance(node, dict):
+        server = node.get("server") or node.get("host") or node.get("address") or node.get("ip")
+        if server:
+            secret = str(node.get("secret") or "")
+            port = node.get("port")
+            via = node.get("via")
+            if via:
+                out.append(f"tg://webproxy?server={server}&secret={secret}")
+            elif port:
+                line = f"tg://{'proxy' if secret else 'socks'}?server={server}&port={port}"
+                if secret:
+                    line += f"&secret={secret}"
+                user = node.get("user") or node.get("username")
+                pwd = node.get("pass") or node.get("password")
+                if user:
+                    line += f"&user={urllib.parse.quote(str(user))}"
+                if pwd:
+                    line += f"&pass={urllib.parse.quote(str(pwd))}"
+                out.append(line)
+        for v in node.values():
+            if isinstance(v, (dict, list)):
+                _links_from_json(v, out, depth + 1)
+    elif isinstance(node, list):
+        for v in node:
+            _links_from_json(v, out, depth + 1)
+    return out
+
+
+def extract_proxy_links(text):
+    """Достаёт ссылки на прокси из текста любого формата: обычный текст, HTML,
+    JSON-список, закодированные ссылки, base64-подписка."""
+    if not text:
+        return []
+    text = text.replace("&amp;", "&")
+    links = PROXY_LINK_RE.findall(text)
+    if not links:
+        un = urllib.parse.unquote(text)
+        if un != text:
+            links = PROXY_LINK_RE.findall(un)
+    try:
+        data = json.loads(text)
+        links = links + _links_from_json(data)
+    except Exception:
+        pass
+    if not links:
+        blob = "".join(text.split())
+        if len(blob) >= 40 and re.fullmatch(r"[A-Za-z0-9+/_=-]+", blob):
+            try:
+                padded = blob.replace("-", "+").replace("_", "/")
+                padded += "=" * ((4 - len(padded) % 4) % 4)
+                decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+                links = PROXY_LINK_RE.findall(decoded.replace("&amp;", "&"))
+            except Exception:
+                pass
+    return links
+
+
+def fetch_web_text(url, timeout=15):
+    import requests
+
+    r = requests.get(
+        url,
+        timeout=timeout,
+        headers={"User-Agent": "Mozilla/5.0 (Linux; Android 14) ProxyHub/" + __version__},
+    )
+    r.raise_for_status()
+    if len(r.content) > WEB_MAX_BYTES:
+        raise ValueError("файл слишком большой")
+    return r.content.decode("utf-8", errors="replace")
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Пинг: нативный делегат
+# ════════════════════════════════════════════════════════════════════
+
+class _NativeTimeDelegate(java.dynamic_proxy(RequestTimeDelegate)):
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def run(self, time_val):
+        try:
+            self._fn(time_val)
+        except Exception as e:
+            _log(f"delegate cb: {e}")
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Java-прокси, диалоги, уведомление с таймером
+# ════════════════════════════════════════════════════════════════════
+
+class _Runnable(java.dynamic_proxy(jclass("java.lang.Runnable"))):
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def run(self):
+        try:
+            self._fn()
+        except Exception as e:
+            _log(f"runnable: {e}")
+
+
+class _DialogClick(java.dynamic_proxy(jclass("android.content.DialogInterface$OnClickListener"))):
+    def __init__(self, fn=None):
+        super().__init__()
+        self._fn = fn
+
+    def onClick(self, dialog, which):
+        try:
+            if self._fn:
+                self._fn(int(which))
+        except Exception as e:
+            _log(f"dialog click: {e}")
+
+
+class _LongClick(java.dynamic_proxy(jclass("android.view.View$OnLongClickListener"))):
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def onLongClick(self, view):
+        try:
+            self._fn()
+        except Exception as e:
+            _log(f"long click: {e}")
+        return True
+
+
+def _later(fn, delay):
+    """Выполнить fn в UI-потоке через delay секунд."""
+    threading.Timer(delay, lambda: run_on_ui_thread(fn)).start()
+
+
+def _is_dark():
+    try:
+        return bool(Theme.isCurrentThemeDark())
+    except Exception:
+        return True
+
+
+def _activity():
+    try:
+        fr = get_last_fragment()
+        return fr.getParentActivity() if fr else None
+    except Exception:
+        return None
+
+
+def _dialog_builder(act):
+    return jclass("android.app.AlertDialog$Builder")(act, 4 if _is_dark() else 5)
+
+
+def _choose(title, labels, on_pick):
+    """Меню выбора (UI-поток). on_pick(index)."""
+    act = _activity()
+    if act is None:
+        return
+    b = _dialog_builder(act)
+    b.setTitle(title)
+    b.setItems(jarray(jclass("java.lang.CharSequence"))(list(labels)), _DialogClick(on_pick))
+    b.show()
+
+
+def _input_dialog(title, hint, positive, on_ok):
+    """Диалог с многострочным полем (UI-поток). on_ok(text)."""
+    act = _activity()
+    if act is None:
+        return
+    from android.widget import EditText as _AndroidEdit, FrameLayout
+
+    et = _AndroidEdit(act)
+    et.setHint(hint)
+    et.setMinLines(4)
+    et.setGravity(51)  # TOP | LEFT
+    et.setInputType(1 | 131072)  # text | multiline
+    box = FrameLayout(act)
+    box.setPadding(_dp(20), _dp(8), _dp(20), 0)
+    box.addView(et)
+    b = _dialog_builder(act)
+    b.setTitle(title)
+    b.setView(box)
+    b.setPositiveButton(positive, _DialogClick(lambda w: on_ok(str(et.getText()))))
+    b.setNegativeButton("Отмена", _DialogClick())
+    b.show()
+
+
+def _confirm_dialog(title, message, ok_text, on_ok):
+    frag = get_last_fragment()
+    act = frag.getParentActivity() if frag else None
+    if not act:
+        return
+    b = AlertDialogBuilder(act)
+    b.set_title(title)
+    b.set_message(message)
+
+    def _ok(bld, which):
+        bld.dismiss()
+        on_ok()
+
+    b.set_positive_button(ok_text, _ok)
+    b.set_negative_button("Отмена", lambda bld, which: bld.dismiss())
+    b.show()
+
+
+def _timed_bulletin(text, button_text, on_click, seconds=5):
+    """Уведомление Telegram с кольцом обратного отсчёта и кнопкой (UI-поток).
+    Возвращает True, если удалось показать."""
+    try:
+        fragment = get_last_fragment()
+        ctx = fragment.getParentActivity() if fragment else None
+        if ctx is None:
+            return False
+        Bulletin = jclass("org.telegram.ui.Components.Bulletin")
+        LottieLayout = jclass("org.telegram.ui.Components.Bulletin$LottieLayout")
+        UndoButton = jclass("org.telegram.ui.Components.Bulletin$UndoButton")
+        try:
+            rp = fragment.getResourceProvider()
+        except Exception:
+            rp = None
+        layout = LottieLayout(ctx, rp)
+        layout.textView.setText(text)
+        try:
+            layout.setTimer()
+        except Exception as e:
+            _log(f"setTimer: {e}")
+        btn = None
+        for args in ((ctx, True), (ctx, True, rp)):
+            try:
+                btn = UndoButton(*args)
+                break
+            except Exception:
+                continue
+        if btn is None:
+            return False
+        try:
+            btn.setText(button_text)
+        except Exception as e:
+            _log(f"btn.setText: {e}")
+        btn.setUndoAction(_Runnable(on_click))
+        layout.setButton(btn)
+        Bulletin.make(fragment, layout, int(seconds * 1000)).show()
+        return True
+    except Exception as e:
+        _log(f"timed bulletin: {e}")
+        return False
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Автопилот: состояние и «тихие» ядра действий
+# ════════════════════════════════════════════════════════════════════
+
+_PILOT = {"running": False, "cancel": False, "step": 0, "total": 0, "text": ""}
+_PILOT_UI = {}
+_PILOT_LOCK = threading.Lock()
+
+
+def _ui_call(fn, timeout=40):
+    """Выполняет fn в UI-потоке и ждёт результат (вызывать только из фонового потока)."""
+    box, ev = {}, threading.Event()
+
+    def run():
+        try:
+            box["r"] = fn()
+        except Exception as e:
+            box["e"] = e
+        finally:
+            ev.set()
+
+    run_on_ui_thread(run)
+    if not ev.wait(timeout):
+        raise TimeoutError("UI-поток не ответил")
+    if "e" in box:
+        raise box["e"]
+    return box.get("r")
+
+
+def _rank(proxies):
+    """Рабочие прокси от самого быстрого к самому медленному."""
+    def key(p):
+        try:
+            ping = int(getattr(p, "ping", 0) or 0)
+        except Exception:
+            ping = 0
+        return ping if ping > 0 else 10 ** 9
+
+    return sorted(proxies, key=key)
+
+
+def _dedupe_core():
+    seen, dups = set(), []
+    for p in _proxy_list_snapshot():
+        k = ":".join(str(x) for x in _info_fields(p))
+        if k in seen:
+            dups.append(p)
+        else:
+            seen.add(k)
+    return _delete_proxies(dups) if dups else 0
+
+
+def _sort_core():
+    SharedConfig.loadProxyList()
+    al = SharedConfig.proxyList
+    items = _jlist(al)
+    if len(items) <= 1:
+        return False
+
+    def sk(i):
+        av = bool(getattr(i, "available", False))
+        p = int(getattr(i, "ping", 0) or 0)
+        return (1, 10 ** 9) if (not av or p <= 0) else (0, p)
+
+    items.sort(key=sk)
+    al.clear()
+    for it in items:
+        al.add(it)
+    _save_proxies()
+    _notify_proxies_changed()
+    return True
+
+
+def _optimize_core():
+    mod = 0
+    for p in _proxy_list_snapshot():
+        changed = False
+        secret = str(getattr(p, "secret", "") or "")
+        if len(secret) == 32 and all(c in "0123456789abcdefABCDEF" for c in secret):
+            p.secret = "dd" + secret
+            changed = True
+        addr = str(getattr(p, "address", "") or "")
+        if addr and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", addr):
+            try:
+                ip = socket.gethostbyname(addr)
+                if ip != addr:
+                    p.address = ip
+                    changed = True
+            except Exception:
+                pass
+        if changed:
+            mod += 1
+    if mod:
+        _save_proxies()
+        _notify_proxies_changed()
+    return mod
+
+
+def _connect_proxy(info):
+    """Включает прокси и делает его текущим. Возвращает True, если удалось."""
+    a, po, secret, user, pw = _info_fields(info)
+    if not a or not po:
+        return False
+    ok = False
+    try:
+        SharedConfig.setCurrentProxy(info)
+        ok = True
+    except Exception as e:
+        _log(f"setCurrentProxy: {e}")
+    try:
+        SharedConfig.currentProxy = info
+    except Exception:
+        pass
+    try:
+        ed = MessagesController.getGlobalMainSettings().edit()
+        ed.putBoolean("proxy_enabled", True)
+        ed.putString("proxy_ip", a)
+        ed.putString("proxy_pass", pw)
+        ed.putString("proxy_user", user)
+        ed.putInt("proxy_port", int(po))
+        ed.putString("proxy_secret", secret)
+        ed.apply()
+        ok = True
+    except Exception as e:
+        _log(f"proxy prefs: {e}")
+    try:
+        ConnectionsManager.setProxySettings(True, a, int(po), user, pw, secret)
+        ok = True
+    except Exception as e:
+        _log(f"setProxySettings: {e}")
+    _save_proxies()
+    _notify_proxies_changed()
+    return ok
+
+
+def _fmt_duration(sec):
+    sec = int(sec)
+    return f"{sec} с" if sec < 60 else f"{sec // 60} мин {sec % 60} с"
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Тест белых списков
+# ════════════════════════════════════════════════════════════════════
+
+# Группы сайтов для теста белых списков (из sites.txt)
+WL_WHITELIST = [
+    "vk.ru",
+    "yandex.ru",
+    "dzen.ru",
+    "ok.ru",
+    "2gis.ru",
+    "mail.ru",
+    "rutube.ru",
+    "avito.ru",
+    "wildberries.ru",
+    "ozon.ru",
+    "gosuslugi.ru",
+    "samokat.ru",
+    "cdek.ru",
+    "5ka.ru",
+    "alfabank.ru",
+    "vtb.ru",
+    "hh.ru",
+    "mts.ru",
+    "megafon.ru",
+    "t2.ru",
+    "beeline.ru",
+    "kuper.ru",
+    "music.yandex.ru",
+    "kinopoisk.ru",
+    "ivi.ru",
+    "okko.tv",
+    "rzd.ru",
+    "aeroflot.ru",
+    "tass.ru",
+    "kommersant.ru",
+    "lenta.ru",
+]
+
+WL_RUSSIAN = [
+    "habr.com",
+    "tproger.ru",
+    "citilink.ru",
+    "lamoda.ru",
+    "drom.ru",
+    "auto.ru",
+    "stepik.org",
+    "vc.ru",
+    "dtf.ru",
+    "www.opennet.ru",
+    "www.linux.org.ru",
+    "proglib.io",
+    "3dnews.ru",
+    "www.ixbt.com",
+    "overclockers.ru",
+    "www.cyberforum.ru",
+    "www.nix.ru",
+    "www.regard.ru",
+    "www.onlinetrade.ru",
+    "www.sportmaster.ru",
+    "petrovich.ru",
+    "www.drive2.ru",
+    "www.sports.ru",
+    "www.championat.com",
+    "skillbox.ru",
+    "netology.ru",
+    "geekbrains.ru",
+    "sky.pro",
+    "www.litres.ru",
+    "pikabu.ru",
+    "irecommend.ru",
+    "otzovik.com",
+    "www.farpost.ru",
+]
+
+WL_NEUTRAL = [
+    "github.com",
+    "gitlab.com",
+    "stackoverflow.com",
+    "python.org",
+    "developer.mozilla.org",
+    "linux.org",
+    "kernel.org",
+    "ubuntu.com",
+    "archlinux.org",
+    "nodejs.org",
+    "google.com",
+    "amazon.com",
+    "2ip.io",
+    "fedoraproject.org",
+    "linuxmint.com",
+    "opensuse.org",
+    "alpinelinux.org",
+    "freebsd.org",
+    "gentoo.org",
+    "nixos.org",
+    "rust-lang.org",
+    "go.dev",
+    "php.net",
+    "ruby-lang.org",
+    "deno.com",
+    "www.typescriptlang.org",
+    "www.postgresql.org",
+    "react.dev",
+    "svelte.dev",
+    "angular.dev",
+    "nextjs.org",
+    "vite.dev",
+    "expressjs.com",
+    "www.djangoproject.com",
+    "flask.palletsprojects.com",
+    "tailwindcss.com",
+    "git-scm.com",
+    "www.docker.com",
+    "kubernetes.io",
+    "www.gnu.org",
+    "www.apache.org",
+    "www.mozilla.org",
+    "www.videolan.org",
+    "www.blender.org",
+    "www.gimp.org",
+    "www.libreoffice.org",
+    "www.openstreetmap.org",
+    "archive.org",
+    "www.npmjs.com",
+    "pypi.org",
+    "crates.io",
+    "pkg.go.dev",
+    "hub.docker.com",
+    "sourceforge.net",
+    "codeberg.org",
+]
+
+WL_COLORS = {"ok": "#2E9E5B", "warn": "#F59E0B", "bad": "#D64545", "offline": "#8A8F98"}
+
+_WL = {"running": False, "done": 0, "total": 0}
+_WL_UI = {}
+
+
+def _net_info():
+    info = {"type": "—", "connected": False, "name": "—", "vpn": False}
+    try:
+        ctx = ApplicationLoader.applicationContext
+        cm = ctx.getSystemService("connectivity")
+        net = cm.getActiveNetwork()
+        if net is None:
+            info["type"] = "Нет сети"
+            return info
+        caps = cm.getNetworkCapabilities(net)
+        if caps is None:
+            return info
+        info["connected"] = True
+        if caps.hasTransport(1):
+            info["type"] = "Wi-Fi"
+        elif caps.hasTransport(0):
+            info["type"] = "Мобильный интернет"
+        elif caps.hasTransport(3):
+            info["type"] = "Ethernet"
+        else:
+            info["type"] = "Другое"
+        info["vpn"] = bool(caps.hasTransport(4))
+        try:
+            op = str(ctx.getSystemService("phone").getNetworkOperatorName() or "")
+            if op and info["type"] == "Мобильный интернет":
+                info["name"] = op
+            elif info["type"] == "Wi-Fi":
+                info["name"] = "Wi-Fi"
+        except Exception:
+            pass
+    except Exception as e:
+        _log(f"net info: {e}")
+    return info
+
+
+def _tls_ok(host, timeout=4.0):
+    """Доступен ли сайт: TCP + TLS-рукопожатие с SNI (именно по SNI режут белые списки)."""
+    import ssl
+
+    try:
+        with socket.create_connection((host, 443), timeout=timeout) as s:
+            s.settimeout(timeout)
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with ctx.wrap_socket(s, server_hostname=host):
+                return True
+    except Exception:
+        return False
+
+
+def _wl_verdict(counts, totals):
+    wl, ru, nt = [c / max(1, t) for c, t in zip(counts, totals)]
+    if max(wl, ru, nt) < 0.1:
+        return "offline", "Нет соединения с интернетом"
+    if wl >= 0.6 and nt <= 0.35:
+        return "bad", "Обнаружены белые списки"
+    if wl >= 0.6 and (nt <= 0.65 or ru <= 0.5):
+        return "warn", "Возможны ограничения"
+    return "ok", "Белые списки не обнаружены"
+
+
+def _wl_start():
+    if _WL["running"]:
+        return
+    groups = (WL_WHITELIST, WL_RUSSIAN, WL_NEUTRAL)
+    _WL.update(running=True, done=0, total=sum(len(g) for g in groups))
+    run_on_ui_thread(_wl_apply)
+
+    def worker():
+        try:
+            totals = [len(g) for g in groups]
+            counts = [0, 0, 0]
+            cache, lock = {}, threading.Lock()
+            jobs = [(gi, h) for gi, g in enumerate(groups) for h in g]
+
+            def check(job):
+                try:
+                    gi, host = job
+                    with lock:
+                        known = cache.get(host)
+                    ok = known if known is not None else _tls_ok(host)
+                    with lock:
+                        cache[host] = ok
+                        if ok:
+                            counts[gi] += 1
+                        _WL["done"] += 1
+                    run_on_ui_thread(_wl_apply)
+                except Exception as e:
+                    _log(f"wl check: {e}")
+
+            with ThreadPoolExecutor(max_workers=24) as pool:
+                list(pool.map(check, jobs))
+            kind, text = _wl_verdict(counts, totals)
+            res = {
+                "t": time.time(),
+                "counts": counts,
+                "totals": totals,
+                "sites": [
+                    [{"host": host, "ok": bool(cache.get(host, False))} for host in group]
+                    for group in groups
+                ],
+                "kind": kind,
+                "text": text,
+                "net": _net_info()["type"],
+            }
+            if _PLUGIN is not None:
+                _PLUGIN.set_setting("wl_last", json.dumps(res))
+        except Exception as e:
+            _log(f"wl worker: {e}")
+        finally:
+            _WL["running"] = False
+            run_on_ui_thread(_wl_apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _wl_show_site_results(index):
+    if _PLUGIN is None:
+        return
+    labels = ("Белый список", "Российские", "Нейтральные")
+    try:
+        last = json.loads(_PLUGIN.get_setting("wl_last", "") or "null")
+        sites = last.get("sites") if last else None
+        if not sites or len(sites) <= index:
+            BulletinHelper.show_info("Сначала запустите тест, чтобы увидеть результаты по сайтам")
+            return
+
+        results = sites[index]
+        working = [site["host"] for site in results if site.get("ok")]
+        unavailable = [site["host"] for site in results if not site.get("ok")]
+        message = (
+            f"Работают ({len(working)}):\n"
+            + ("\n".join(working) if working else "Нет")
+            + f"\n\nНе работают ({len(unavailable)}):\n"
+            + ("\n".join(unavailable) if unavailable else "Нет")
+        )
+        act = _activity()
+        if act is None:
+            BulletinHelper.show_error("Не удалось открыть список сайтов")
+            return
+        builder = _dialog_builder(act)
+        builder.setTitle(labels[index])
+        builder.setMessage(message)
+        builder.setPositiveButton("Закрыть", _DialogClick())
+        builder.show()
+    except Exception as e:
+        _log(f"wl site results: {e}")
+        BulletinHelper.show_error(f"Не удалось показать результаты: {e}")
+
+
+def _wl_apply():
+    ui = _WL_UI
+    if not ui or "root" not in ui:
+        return
+    try:
+        white = Theme.getColor(Theme.key_windowBackgroundWhite)
+        gray_bg = Theme.getColor(Theme.key_windowBackgroundGray)
+        text_c = Theme.getColor(Theme.key_windowBackgroundWhiteBlackText)
+        sub_c = Theme.getColor(Theme.key_windowBackgroundWhiteGrayText2)
+        ui["info"].setBackground(_rounded(white, 20))
+        ui["res"].setBackground(_rounded(white, 20))
+        for tile in ui["tiles"]:
+            tile.setBackground(_rounded(gray_bg, 14))
+
+        net = _net_info()
+        ui["type"].setText(net["type"])
+        ui["type"].setTextColor(text_c)
+        ui["status"].setText("Подключено" if net["connected"] else "Нет сети")
+        ui["status"].setTextColor(_color(WL_COLORS["ok"] if net["connected"] else WL_COLORS["bad"]))
+        ui["net"].setText(net["name"])
+        ui["net"].setTextColor(text_c)
+        ui["vpn_row"].setVisibility(0 if net["vpn"] else 8)
+
+        if _WL["running"]:
+            pct = int(100 * _WL["done"] / max(1, _WL["total"]))
+            ui["btn_main"].setText(f"{pct}%")
+            ui["btn_sub"].setText("Идёт проверка…")
+        else:
+            ui["btn_main"].setText("ТЕСТ")
+            ui["btn_sub"].setText("Проверка")
+
+        last = None
+        try:
+            last = json.loads(_PLUGIN.get_setting("wl_last", "") or "null") if _PLUGIN else None
+        except Exception:
+            last = None
+        if last:
+            col = WL_COLORS.get(last.get("kind"), WL_COLORS["offline"])
+            ui["pill"].setText(last.get("text", ""))
+            ui["pill"].setTextColor(_color(col))
+            ui["pill"].setBackground(_rounded(_color("#26" + col.lstrip("#")), 14))
+            ui["time"].setText(_fmt_time(last.get("t", 0)) + " · " + str(last.get("net", "")))
+            for i in range(3):
+                ui["cnt"][i].setText(f"{last['counts'][i]}/{last['totals'][i]}")
+        else:
+            ui["pill"].setText("Тест ещё не запускался")
+            ui["pill"].setTextColor(sub_c)
+            ui["pill"].setBackground(_rounded(gray_bg, 14))
+            ui["time"].setText("Нажмите на круглую кнопку")
+            for i in range(3):
+                ui["cnt"][i].setText("—")
+        for i in range(3):
+            ui["cnt"][i].setTextColor(_color(BRAND))
+        ui["time"].setTextColor(sub_c)
+    except Exception as e:
+        _log(f"wl apply: {e}")
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Plugin
+# ════════════════════════════════════════════════════════════════════
+
+class ProxyHubPlugin(BasePlugin):
+
+    # ── lifecycle ───────────────────────────────────────────────────
+
+    def on_plugin_load(self):
+        global _PLUGIN
+        _PLUGIN = self
+        self._running = True
+        self._collect_lock = threading.Lock()
+        self._busy = False
+        self._ping_busy = False
+        self._unhooks: List[Any] = []
+        self._ip_cache = {}
+        self._pending_ips = set()
+        self._batch_lock = threading.Lock()
+        self._peer_cache = {}
+        self._geo_fail = {}
+        self._geo_active = False
+        self._dead_keys = set()
+        try:
+            self._status = json.loads(self.get_setting("src_status", "{}"))
+        except Exception:
+            self._status = {}
+        try:
+            self._ip_cache = json.loads(self.get_setting("ip_cache", "{}"))
+        except Exception:
+            self._ip_cache = {}
+
+        try:
+            self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.DRAWER_MENU,
+                    text="Proxy Hub",
+                    icon="msg_settings",
+                    on_click=self._open_settings,
+                    item_id="proxy_hub_drawer_item",
+                )
+            )
+        except Exception as e:
+            _log(f"drawer item: {e}")
+
+        try:
+            self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.CHAT_ACTION_MENU,
+                    text="Proxy Hub: добавить чат в источники",
+                    icon="msg_proxy",
+                    on_click=self._menu_add_source,
+                )
+            )
+        except Exception as e:
+            _log(f"menu item: {e}")
+
+        try:
+            self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.CHAT_ACTION_MENU,
+                    text="Proxy Hub: собрать прокси из этого чата",
+                    icon="msg_download",
+                    on_click=self._menu_collect_here,
+                )
+            )
+        except Exception as e:
+            _log(f"collect menu item: {e}")
+
+        self._install_hooks()
+        self._start_scheduler()
+        _log("loaded v" + __version__)
+
+    def on_plugin_unload(self):
+        global _PLUGIN
+        self._running = False
+        for u in list(self._unhooks):
+            try:
+                self.unhook_method(u)
+            except Exception:
+                pass
+        self._unhooks.clear()
+        _PLUGIN = None
+
+    def _hook(self, method, hook, priority=None):
+        try:
+            if priority is None:
+                u = self.hook_method(method, hook)
+            else:
+                u = self.hook_method(method, hook, priority=priority)
+            if u is not None:
+                self._unhooks.append(u)
+        except Exception as e:
+            _log(f"hook failed: {e}")
+
+    # ── helpers: settings ───────────────────────────────────────────
+
+    def _sources(self):
+        raw = str(self.get_setting("sources_text", "") or "")
+        out, seen = [], set()
+        for line in raw.splitlines():
+            src = parse_source(line)
+            if src and src["key"] not in seen:
+                seen.add(src["key"])
+                out.append(src)
+        return out
+
+    def _web_sources(self):
+        raw = str(self.get_setting("web_sources", "") or "")
+        out, seen = [], set()
+        for line in raw.splitlines():
+            url = normalize_web_url(line)
+            if url and url not in seen:
+                seen.add(url)
+                out.append(url)
+        return out
+
+    def _interval_minutes(self):
+        idx = int(self.get_setting("interval_idx", DEFAULT_INTERVAL_IDX))
+        idx = max(0, min(idx, len(INTERVAL_MINUTES) - 1))
+        val = INTERVAL_MINUTES[idx]
+        if val is None:
+            try:
+                val = int(str(self.get_setting("custom_minutes", "60")).strip())
+            except Exception:
+                val = 60
+            val = max(5, val)
+        return val
+
+    def _timer_label(self):
+        if not self.get_setting("auto_enabled", True):
+            return "Выключен"
+        idx = int(self.get_setting("interval_idx", DEFAULT_INTERVAL_IDX))
+        if INTERVAL_MINUTES[max(0, min(idx, len(INTERVAL_MINUTES) - 1))] is None:
+            return f"Каждые {self._interval_minutes()} мин"
+        return f"Каждые {INTERVAL_LABELS[idx]}"
+
+    def _next_run_text(self):
+        if not self.get_setting("auto_enabled", True):
+            return "Автосбор выключен"
+        last = float(self.get_setting("last_run", 0) or 0)
+        if last <= 0:
+            return "Первый сбор — скоро после запуска"
+        left = last + self._interval_minutes() * 60 - time.time()
+        return f"Следующий сбор через {_fmt_left(left)}" if left > 0 else "Следующий сбор — вот-вот"
+
+    def _refresh_settings(self):
+        run_on_ui_thread(lambda: self.set_setting("ui_refresh", time.time(), reload_settings=True))
+
+    def _bg(self, fn, *args):
+        threading.Thread(target=lambda: fn(*args), daemon=True).start()
+
+    # ── открытие настроек из бокового меню ──────────────────────────
+
+    def _open_settings(self, context=None):
+        def _open():
+            try:
+                fragment = _safe_get(context, "fragment") if context is not None else None
+                fragment = fragment or get_last_fragment()
+                if fragment is None:
+                    BulletinHelper.show_error("Не найден активный экран")
+                    return
+
+                # 1) встроенные методы SDK (если есть)
+                for name in ("open_settings", "show_settings", "open_plugin_settings"):
+                    fn = getattr(self, name, None)
+                    if callable(fn):
+                        try:
+                            fn()
+                            return
+                        except Exception as e:
+                            _log(f"{name}: {e}")
+
+                # 2) PluginSettingsActivity напрямую
+                cls = None
+                for cname in (
+                    "com.exteragram.messenger.plugins.ui.PluginSettingsActivity",
+                    "com.exteragram.messenger.plugins.PluginSettingsActivity",
+                ):
+                    cls = find_class(cname)
+                    if cls is not None:
+                        break
+                if cls is None:
+                    BulletinHelper.show_error("Не удалось открыть настройки")
+                    return
+
+                plugin_obj = None
+                try:
+                    PC = jclass("com.exteragram.messenger.plugins.PluginsController").getInstance()
+                    for getter in ("getPlugin", "getPluginById"):
+                        try:
+                            plugin_obj = getattr(PC, getter)(__id__)
+                            if plugin_obj is not None:
+                                break
+                        except Exception:
+                            continue
+                    if plugin_obj is None:
+                        try:
+                            plugin_obj = PC.plugins.get(__id__)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    _log(f"PluginsController: {e}")
+
+                last_err = None
+                for arg in (plugin_obj, __id__):
+                    if arg is None:
+                        continue
+                    try:
+                        fragment.presentFragment(cls(arg))
+                        return
+                    except Exception as e:
+                        last_err = e
+                _log(f"open settings failed: {last_err}")
+                BulletinHelper.show_error("Не удалось открыть настройки")
+            except Exception as e:
+                _log(f"open settings: {e}")
+                BulletinHelper.show_error("Не удалось открыть настройки")
+
+        run_on_ui_thread(_open)
+
+    # ── меню чата ───────────────────────────────────────────────────
+
+    def _chat_line(self, param):
+        """Строка вида dialog:ID[:topic] для чата, из которого вызвано меню."""
+        raw_id = _safe_get(param, "dialog_id") or _safe_get(param, "dialogId")
+        fragment = _safe_get(param, "fragment")
+        if raw_id is None and fragment is not None and hasattr(fragment, "getDialogId"):
+            raw_id = fragment.getDialogId()
+        if raw_id is None:
+            return None
+        topic = _safe_get(param, "topic_id") or _safe_get(param, "topicId") or 0
+        if not topic and fragment is not None:
+            if hasattr(fragment, "getTopicId"):
+                topic = fragment.getTopicId()
+            elif hasattr(fragment, "getThreadId"):
+                topic = fragment.getThreadId()
+        return f"dialog:{int(raw_id)}:{int(topic) if topic else 0}"
+
+    def _menu_add_source(self, param):
+        try:
+            line = self._chat_line(param)
+            if not line:
+                BulletinHelper.show_error("Не удалось определить чат")
+                return
+            src = parse_source(line)
+            if any(s["key"] == src["key"] for s in self._sources()):
+                BulletinHelper.show_info("Этот чат уже в источниках")
+                return
+            cur = str(self.get_setting("sources_text", "") or "").rstrip()
+            self.set_setting("sources_text", (cur + "\n" if cur else "") + line)
+            BulletinHelper.show_success("Чат добавлен в источники Proxy Hub")
+        except Exception as e:
+            _log(f"menu add source: {e}")
+            BulletinHelper.show_error("Ошибка добавления чата")
+
+    def _menu_collect_here(self, param):
+        try:
+            line = self._chat_line(param)
+            if not line:
+                BulletinHelper.show_error("Не удалось определить чат")
+                return
+            src = parse_source(line)
+            BulletinHelper.show_info("Собираю прокси из этого чата…")
+            self._bg(self._collect_one, src)
+        except Exception as e:
+            _log(f"menu collect here: {e}")
+            BulletinHelper.show_error("Ошибка сбора из чата")
+
+    def _collect_single(self, fetch):
+        """Разовый сбор. fetch() -> (список ссылок, ошибка)."""
+        if not self._collect_lock.acquire(blocking=False):
+            run_on_ui_thread(lambda: BulletinHelper.show_info("Сбор уже идёт…"))
+            return
+        self._busy = True
+        try:
+            links, err = fetch()
+            if err:
+                _log(f"collect_single: {err}")
+                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Не удалось получить данные: {err}"))
+                return
+            seen = _existing_keys()
+            found = added = dups = 0
+            for link in links:
+                found += 1
+                res = _add_link(link, seen)
+                if res == "added":
+                    added += 1
+                elif res == "dup":
+                    dups += 1
+            if added:
+                _save_proxies()
+                _notify_proxies_changed()
+            self._refresh_settings()
+            if added:
+                txt = f"Добавлено {added}, дублей {dups}"
+                run_on_ui_thread(lambda: BulletinHelper.show_success(txt))
+            elif found:
+                txt = f"Новых нет: все {found} уже в списке или не распознаны"
+                run_on_ui_thread(lambda: BulletinHelper.show_info(txt))
+            else:
+                run_on_ui_thread(lambda: BulletinHelper.show_info("Прокси не найдено"))
+        except Exception as e:
+            _log(f"collect_single: {e}")
+            run_on_ui_thread(lambda m=str(e): BulletinHelper.show_error(f"Ошибка сбора: {m}"))
+        finally:
+            self._busy = False
+            self._collect_lock.release()
+
+    def _collect_one(self, src):
+        """Разовый сбор из одного чата/канала (без добавления в источники)."""
+        try:
+            limit = int(str(self.get_setting("scan_limit", "100")).strip())
+        except Exception:
+            limit = 100
+        limit = max(10, min(limit, 100))
+
+        def fetch():
+            msgs, err = self._fetch_source(src, 0, limit)
+            if err:
+                return [], err
+            links = []
+            for msg in msgs:
+                links.extend(self._extract_links(msg))
+            return links, None
+
+        self._collect_single(fetch)
+
+    def _collect_web_one(self, url):
+        def fetch():
+            try:
+                return extract_proxy_links(fetch_web_text(url)), None
+            except Exception as e:
+                return [], str(e)
+
+        self._collect_single(fetch)
+
+    # ── список источников ───────────────────────────────────────────
+
+    def _dialog_title(self, did):
+        try:
+            mc = MessagesController.getInstance(UserConfig.selectedAccount)
+            from java.lang import Long
+
+            if did < 0:
+                cid = -did
+                if cid > 1000000000000:
+                    cid -= 1000000000000
+                chat = mc.getChat(Long(cid))
+                if chat is not None and chat.title:
+                    return str(chat.title)
+            else:
+                user = mc.getUser(Long(did))
+                if user is not None:
+                    name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+                    if name:
+                        return name
+        except Exception:
+            pass
+        return f"Чат {did}"
+
+    def _source_entries(self):
+        out, seen = [], set()
+        for line in str(self.get_setting("sources_text", "") or "").splitlines():
+            src = parse_source(line)
+            if not src or src["key"] in seen:
+                continue
+            seen.add(src["key"])
+            if src["kind"] == "dialog":
+                title = self._dialog_title(int(src["id"]))
+                kind = "Telegram · чат"
+            else:
+                title = "@" + src["name"]
+                kind = "Telegram · канал"
+            if src.get("topic"):
+                kind += f" · топик {src['topic']}"
+            out.append({"kind": "tg", "src": src, "raw": line.strip(), "key": src["key"], "title": title, "label": kind})
+        for line in str(self.get_setting("web_sources", "") or "").splitlines():
+            url = normalize_web_url(line)
+            if not url or ("web:" + url) in seen:
+                continue
+            seen.add("web:" + url)
+            short = re.sub(r"^https?://(www\.)?", "", url)
+            if len(short) > 44:
+                short = short[:42] + "…"
+            out.append({"kind": "web", "url": url, "raw": line.strip(), "key": "web:" + url, "title": short, "label": "Сайт"})
+        return out
+
+    def _set_status(self, key, text):
+        self._status[key] = f"{text} · {_fmt_time(time.time())}"
+        try:
+            self.set_setting("src_status", json.dumps(self._status))
+        except Exception:
+            pass
+        self._refresh_settings()
+
+    def _add_lines(self, text):
+        """Разбирает строки: Telegram-каналы/чаты и сайты. Возвращает (добавлено, дублей, не распознано)."""
+        tg_keys = {s["key"] for s in self._sources()}
+        web_set = set(self._web_sources())
+        new_tg, new_web = [], []
+        dups = bad = 0
+        for line in (text or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if PROXY_LINK_RE.match(line):
+                bad += 1
+                continue
+            src = parse_source(line)
+            if src is not None:
+                if src["key"] in tg_keys:
+                    dups += 1
+                else:
+                    tg_keys.add(src["key"])
+                    new_tg.append(line)
+                continue
+            url = normalize_web_url(line)
+            if url:
+                if url in web_set:
+                    dups += 1
+                else:
+                    web_set.add(url)
+                    new_web.append(line)
+            else:
+                bad += 1
+        if new_tg:
+            cur = str(self.get_setting("sources_text", "") or "").rstrip()
+            self.set_setting("sources_text", (cur + "\n" if cur else "") + "\n".join(new_tg))
+        if new_web:
+            cur = str(self.get_setting("web_sources", "") or "").rstrip()
+            self.set_setting("web_sources", (cur + "\n" if cur else "") + "\n".join(new_web))
+        return len(new_tg) + len(new_web), dups, bad
+
+    def _remove_entry(self, entry):
+        if entry["kind"] == "tg":
+            name, keep = "sources_text", lambda ln: not (parse_source(ln) and parse_source(ln)["key"] == entry["key"])
+        else:
+            name, keep = "web_sources", lambda ln: normalize_web_url(ln) != entry["url"]
+        lines = str(self.get_setting(name, "") or "").splitlines()
+        self.set_setting(name, "\n".join(ln for ln in lines if keep(ln)))
+        self._status.pop(entry["key"], None)
+
+    def _restore_entry(self, entry):
+        name = "sources_text" if entry["kind"] == "tg" else "web_sources"
+        cur = str(self.get_setting(name, "") or "").rstrip()
+        self.set_setting(name, (cur + "\n" if cur else "") + entry["raw"])
+
+    def _source_menu(self, entry):
+        labels, actions = [], []
+        if entry["kind"] == "tg":
+            labels.append("Открыть чат/канал")
+            actions.append(lambda: self._open_source(entry))
+        labels.extend(["Проверить доступность", "Получить новые прокси", "Удалить"])
+
+        def check_source():
+            BulletinHelper.show_info("Проверяю…")
+            self._bg(self._src_check, entry)
+
+        def collect_source():
+            BulletinHelper.show_info("Собираю прокси…")
+            self._bg(self._src_collect, entry)
+
+        actions.extend([
+            check_source,
+            collect_source,
+            lambda: self._src_delete(entry),
+        ])
+        _choose(entry["title"], labels, lambda i: actions[i]())
+
+    def _open_source(self, entry):
+        def open_chat():
+            try:
+                src = entry["src"]
+                topic = int(src.get("topic") or 0)
+                if src["kind"] == "dialog":
+                    dialog_id = int(src["id"])
+                    if dialog_id < 0:
+                        chat_id = -dialog_id
+                        if chat_id > 1000000000000:
+                            chat_id -= 1000000000000
+                        user_id = 0
+                    else:
+                        chat_id, user_id = 0, dialog_id
+                else:
+                    peer = self._resolve_peer(src)
+                    if peer is None:
+                        run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось найти чат или канал"))
+                        return
+                    chat_id = int(getattr(peer, "channel_id", 0) or getattr(peer, "chat_id", 0) or 0)
+                    user_id = int(getattr(peer, "user_id", 0) or 0)
+                    if not chat_id and not user_id:
+                        raise ValueError("Не удалось определить ID чата")
+
+                def navigate():
+                    fragment = get_last_fragment()
+                    chat_activity = find_class("org.telegram.ui.ChatActivity")
+                    if fragment is None or chat_activity is None:
+                        BulletinHelper.show_error("Не удалось открыть чат")
+                        return
+                    Bundle = jclass("android.os.Bundle")
+                    args = Bundle()
+                    if chat_id:
+                        args.putLong("chat_id", chat_id)
+                    else:
+                        args.putLong("user_id", user_id)
+                    if topic > 0:
+                        args.putInt("topic_id", topic)
+                    fragment.presentFragment(chat_activity(args))
+
+                run_on_ui_thread(navigate)
+            except Exception as e:
+                _log(f"open source: {e}")
+                run_on_ui_thread(lambda m=str(e): BulletinHelper.show_error(f"Не удалось открыть источник: {m}"))
+
+        self._bg(open_chat)
+
+    def _src_check(self, entry):
+        try:
+            if entry["kind"] == "tg":
+                msgs, err = self._fetch_source(entry["src"], 0, 1)
+                ok, text = (err is None), ("✓ Доступен" if err is None else f"✗ {err}")
+            else:
+                body = fetch_web_text(entry["url"])
+                ok, text = True, f"✓ Доступен · ссылок: {len(extract_proxy_links(body))}"
+        except Exception as e:
+            ok, text = False, f"✗ {str(e)[:60]}"
+        self._set_status(entry["key"], text)
+        run_on_ui_thread(lambda: (BulletinHelper.show_success if ok else BulletinHelper.show_error)(text))
+
+    def _src_collect(self, entry):
+        if entry["kind"] == "tg":
+            self._collect_one(entry["src"])
+        else:
+            self._collect_web_one(entry["url"])
+
+    def _src_delete(self, entry):
+        self._remove_entry(entry)
+        self._refresh_settings()
+
+        def undo():
+            self._restore_entry(entry)
+            self._refresh_settings()
+
+        if not _timed_bulletin("Источник удалён", "Вернуть", undo):
+            BulletinHelper.show_info("Источник удалён")
+
+    def _act_add_source(self):
+        def ok(text):
+            added, dups, bad = self._add_lines(text)
+            self._refresh_settings()
+            msg = f"Добавлено: {added}"
+            if dups:
+                msg += f", дублей: {dups}"
+            if bad:
+                msg += f", не распознано: {bad}"
+            (BulletinHelper.show_success if added else BulletinHelper.show_info)(msg)
+
+        _input_dialog(
+            "Добавить источник",
+            "@channel\nt.me/channel\nhttps://raw.githubusercontent.com/…\n(по одному в строке)",
+            "Добавить",
+            ok,
+        )
+
+    def _act_import_sources(self):
+        try:
+            clip = ApplicationLoader.applicationContext.getSystemService("clipboard")
+            if not clip or not clip.hasPrimaryClip():
+                BulletinHelper.show_error("Буфер обмена пуст")
+                return
+            raw = str(clip.getPrimaryClip().getItemAt(0).getText() or "")
+            added, dups, bad = self._add_lines(raw)
+            self._refresh_settings()
+            if added:
+                BulletinHelper.show_success(f"Импортировано источников: {added}" + (f" (дублей: {dups})" if dups else ""))
+            else:
+                BulletinHelper.show_info("Новых источников нет" if dups else "Источников в буфере не найдено")
+        except Exception as e:
+            _log(f"import sources: {e}")
+            BulletinHelper.show_error(f"Ошибка импорта: {e}")
+
+    def _act_export_sources(self):
+        try:
+            lines = [e["raw"] for e in self._source_entries()]
+            if not lines:
+                BulletinHelper.show_error("Список источников пуст")
+                return
+            ClipData = jclass("android.content.ClipData")
+            clip = ApplicationLoader.applicationContext.getSystemService("clipboard")
+            clip.setPrimaryClip(ClipData.newPlainText("sources", "\n".join(lines)))
+            BulletinHelper.show_success(f"Источников скопировано: {len(lines)}")
+        except Exception as e:
+            _log(f"export sources: {e}")
+            BulletinHelper.show_error(f"Ошибка экспорта: {e}")
+
+    def _open_proxy_list(self):
+        def _open():
+            try:
+                frag = get_last_fragment()
+                cls = find_class("org.telegram.ui.ProxyListActivity")
+                if frag is None or cls is None:
+                    BulletinHelper.show_error("Не удалось открыть настройки прокси")
+                    return
+                frag.presentFragment(cls())
+            except Exception as e:
+                _log(f"open proxy list: {e}")
+                BulletinHelper.show_error("Не удалось открыть настройки прокси")
+
+        run_on_ui_thread(_open)
+
+    # ── результат пинга: удаление нерабочих в 2 нажатия ─────────────
+
+    def _show_ping_result(self, proxies, ok):
+        bad = len(proxies) - ok
+        msg = f"Готово: {ok} работают, {bad} нет"
+        if bad <= 0:
+            BulletinHelper.show_success(msg)
+            return
+        self._dead_keys = set()
+        for p in proxies:
+            try:
+                if not bool(p.available):
+                    a, po, s, _, _ = _info_fields(p)
+                    self._dead_keys.add(_proxy_key(a, po, s))
+            except Exception:
+                pass
+        if not _timed_bulletin(msg, "Удалить нерабочие", self._ping_step1):
+            BulletinHelper.show_info(msg)
+
+    def _ping_step1(self):
+        n = len(self._dead_keys)
+
+        def show():
+            if not _timed_bulletin(
+                f"Нерабочих прокси: {n}. Подтвердите удаление", "Подтвердить", self._ping_delete_dead
+            ):
+                _confirm_dialog(
+                    "Удалить нерабочие?",
+                    f"Нерабочих прокси: {n}\nБудет удалено: {n}",
+                    "Удалить",
+                    self._ping_delete_dead,
+                )
+
+        _later(show, 0.35)
+
+    def _ping_delete_dead(self):
+        try:
+            dead = []
+            for p in _proxy_list_snapshot():
+                a, po, s, _, _ = _info_fields(p)
+                if _proxy_key(a, po, s) in self._dead_keys and not bool(getattr(p, "available", False)):
+                    dead.append(p)
+            if not dead:
+                BulletinHelper.show_info("Нерабочих прокси не осталось")
+                return
+            removed = _delete_proxies(dead)
+            _notify_proxies_changed()
+            if removed:
+                BulletinHelper.show_success(f"Удалено нерабочих: {removed}")
+            else:
+                BulletinHelper.show_error("Не удалось удалить нерабочие прокси")
+        except Exception as e:
+            _log(f"delete dead: {e}")
+            BulletinHelper.show_error(f"Ошибка: {e}")
+
+    # ── Автопилот: всё одной кнопкой ────────────────────────────────
+
+    def _pilot_begin(self):
+        with _PILOT_LOCK:
+            if _PILOT["running"]:
+                return False
+            _PILOT.update(running=True, cancel=False, step=0, total=0, text="Запуск…")
+        return True
+
+    def _pilot_toggle(self):
+        """Нажатие на большую кнопку: запустить или остановить."""
+        if _PILOT["running"]:
+            _PILOT["cancel"] = True
+            _PILOT["text"] = "Останавливаю после текущего шага…"
+            run_on_ui_thread(_pilot_apply)
+            return
+        if self._pilot_begin():
+            run_on_ui_thread(_pilot_apply)
+            self._bg(self._pilot_run, True)
+
+    def _pilot_keep_top(self):
+        try:
+            return max(0, int(str(self.get_setting("pilot_keep_top", "0")).strip() or 0))
+        except Exception:
+            return 0
+
+    def _desc_proxy(self, p):
+        a, po, sec, _, _ = _info_fields(p)
+        flag = (self._ip_cache.get(a) or {}).get("flag", "")
+        try:
+            ping = int(getattr(p, "ping", 0) or 0)
+        except Exception:
+            ping = 0
+        out = f"{flag + ' ' if flag else ''}{a}:{po} · {'MTProto' if sec else 'SOCKS5'}"
+        return out + (f" · {ping} мс" if ping > 0 else "")
+
+    def _pilot_run(self, manual=True):
+        """Полный цикл. Вызывается в фоновом потоке; _PILOT['running'] уже выставлен."""
+        t0 = time.time()
+        rep = {
+            "found": 0, "added": 0, "dups_removed": 0,
+            "checked": 0, "alive": 0, "dead_removed": 0, "trimmed": 0,
+            "sorted": False, "optimized": 0, "best": "", "connected": False,
+            "cancelled": False, "notes": [], "errors": [],
+        }
+        ctx = {"rep": rep, "manual": manual, "alive": None, "all": None}
+        try:
+            g = self.get_setting
+            keep = self._pilot_keep_top()
+            need_ping = bool(g("pilot_clean", True) or g("pilot_sort", True) or g("pilot_connect", True) or keep > 0)
+
+            steps = []
+            if g("pilot_collect", True) and (self._sources() or self._web_sources()):
+                steps.append(("Сбор из источников", self._pilot_s_collect))
+            if g("pilot_dedupe", True):
+                steps.append(("Удаление дубликатов", self._pilot_s_dedupe))
+            if need_ping:
+                steps.append(("Проверка пинга", self._pilot_s_ping))
+            if g("pilot_clean", True):
+                steps.append(("Удаление нерабочих", self._pilot_s_clean))
+            if keep > 0:
+                steps.append((f"Отбор {keep} лучших", self._pilot_s_trim))
+            if g("pilot_sort", True):
+                steps.append(("Сортировка по пингу", self._pilot_s_sort))
+            if g("pilot_optimize", False):
+                steps.append(("Оптимизация", self._pilot_s_optimize))
+            if g("pilot_connect", True):
+                steps.append(("Подключение лучшего", self._pilot_s_connect))
+
+            if not steps:
+                rep["notes"].append("Не выбрано ни одного шага — включите их ниже")
+            _PILOT["total"] = len(steps)
+
+            for i, (title, fn) in enumerate(steps, 1):
+                if _PILOT["cancel"]:
+                    rep["cancelled"] = True
+                    break
+                _PILOT["step"] = i - 1
+                _PILOT["text"] = f"Шаг {i} из {len(steps)} · {title}…"
+                run_on_ui_thread(_pilot_apply)
+                try:
+                    fn(ctx)
+                except Exception as e:
+                    _log(f"pilot step {title}: {e}")
+                    rep["errors"].append(f"{title}: {e}")
+            _PILOT["step"] = len(steps)
+
+            alive = ctx.get("alive")
+            if alive:
+                try:
+                    rep["best"] = self._desc_proxy(_rank(alive)[0])
+                except Exception:
+                    pass
+        except Exception as e:
+            _log(f"pilot: {e}")
+            rep["errors"].append(str(e))
+        finally:
+            _PILOT["running"] = False
+            _PILOT["cancel"] = False
+            _PILOT["text"] = ""
+        rep["seconds"] = time.time() - t0
+        try:
+            self._pilot_report(rep, manual)
+        except Exception as e:
+            _log(f"pilot report: {e}")
+        self._refresh_settings()
+
+    # ── шаги ──
+
+    def _pilot_s_collect(self, ctx):
+        st = self._collect(manual=False, quiet=True)
+        if st is None:
+            ctx["rep"]["notes"].append("сбор не выполнен (уже идёт или нет источников)")
+            return
+        ctx["rep"]["found"] = st["found"]
+        ctx["rep"]["added"] = st["added"]
+        if st["errors"]:
+            ctx["rep"]["notes"].append(f"источников с ошибкой: {st['errors']}")
+
+    def _pilot_s_dedupe(self, ctx):
+        ctx["rep"]["dups_removed"] = int(_ui_call(_dedupe_core) or 0)
+
+    def _pilot_s_ping(self, ctx):
+        if _proxy_count() == 0:
+            ctx["rep"]["notes"].append("список прокси пуст — проверять нечего")
+            return
+        if self._ping_busy:
+            raise RuntimeError("проверка пинга уже идёт")
+        ev, box = threading.Event(), {}
+
+        def done(proxies):
+            box["p"] = list(proxies)
+            ev.set()
+
+        self._ping_all(on_done=done)
+        if not ev.wait(300):
+            raise RuntimeError("проверка не завершилась вовремя")
+        allp = box.get("p") or []
+        alive = [p for p in allp if bool(getattr(p, "available", False))]
+        ctx["all"], ctx["alive"] = allp, alive
+        ctx["rep"]["checked"] = len(allp)
+        ctx["rep"]["alive"] = len(alive)
+
+    def _pilot_s_clean(self, ctx):
+        allp, alive = ctx.get("all"), ctx.get("alive")
+        if allp is None:
+            return
+        dead = [p for p in allp if not bool(getattr(p, "available", False))]
+        if not dead:
+            return
+        if not alive:
+            # защита: если не ответил ни один — скорее всего нет сети, ничего не трогаем
+            ctx["rep"]["notes"].append("ни один прокси не ответил (возможно, нет интернета) — нерабочие не удалялись")
+            return
+        removed = int(_ui_call(lambda: _delete_proxies(dead)) or 0)
+        ctx["rep"]["dead_removed"] = removed
+        ctx["all"] = list(alive)
+
+    def _pilot_s_trim(self, ctx):
+        alive = ctx.get("alive")
+        keep = self._pilot_keep_top()
+        if not alive or keep <= 0 or len(alive) <= keep:
+            return
+        ranked = _rank(alive)
+        extra = ranked[keep:]
+        removed = int(_ui_call(lambda: _delete_proxies(extra)) or 0)
+        ctx["rep"]["trimmed"] = removed
+        ctx["alive"] = ranked[:keep]
+        ctx["all"] = list(ctx["alive"])
+
+    def _pilot_s_sort(self, ctx):
+        if ctx.get("alive") is None:
+            return
+        ctx["rep"]["sorted"] = bool(_ui_call(_sort_core))
+
+    def _pilot_s_optimize(self, ctx):
+        ctx["rep"]["optimized"] = int(_optimize_core() or 0)
+
+    def _pilot_s_connect(self, ctx):
+        alive = ctx.get("alive")
+        if not alive:
+            ctx["rep"]["notes"].append("подключать нечего — нет рабочих прокси")
+            return
+        best = _rank(alive)[0]
+        if not ctx["manual"]:
+            # при автозапуске не трогаем соединение, если текущий прокси жив
+            try:
+                cur = getattr(SharedConfig, "currentProxy", None)
+                enabled = bool(MessagesController.getGlobalMainSettings().getBoolean("proxy_enabled", False))
+                if cur is not None and enabled:
+                    ck = _info_fields(cur)[:3]
+                    if any(_info_fields(p)[:3] == ck for p in alive):
+                        ctx["rep"]["notes"].append("текущий прокси работает — подключение не менялось")
+                        return
+            except Exception:
+                pass
+        ctx["rep"]["connected"] = bool(_ui_call(lambda: _connect_proxy(best)))
+        if not ctx["rep"]["connected"]:
+            ctx["rep"]["notes"].append("не удалось переключить прокси автоматически")
+
+    # ── отчёт ──
+
+    def _pilot_report(self, rep, manual):
+        lines = []
+        if rep["cancelled"]:
+            lines.append("⏹ Остановлено пользователем")
+        if rep["found"] or rep["added"]:
+            lines.append(f"📥 Найдено ссылок: {rep['found']}, новых прокси: {rep['added']}")
+        if rep["dups_removed"]:
+            lines.append(f"♻️ Удалено дубликатов: {rep['dups_removed']}")
+        if rep["checked"]:
+            lines.append(f"📡 Проверено: {rep['checked']} · работают: {rep['alive']}")
+        if rep["dead_removed"]:
+            lines.append(f"🗑 Удалено нерабочих: {rep['dead_removed']}")
+        if rep["trimmed"]:
+            lines.append(f"✂️ Убрано медленных: {rep['trimmed']}")
+        if rep["sorted"]:
+            lines.append("↕️ Список отсортирован по пингу")
+        if rep["optimized"]:
+            lines.append(f"⚙️ Оптимизировано: {rep['optimized']}")
+        if rep["best"]:
+            lines.append(f"⚡ Лучший: {rep['best']}" + (" — подключён" if rep["connected"] else ""))
+        for n in rep["notes"]:
+            lines.append(f"ℹ️ {n}")
+        for e in rep["errors"]:
+            lines.append(f"⚠️ {e}")
+        if not lines:
+            lines.append("Изменений нет — список уже в порядке")
+        lines.append(f"\n⏱ {_fmt_duration(rep['seconds'])}")
+        text = "\n".join(lines)
+
+        short = f"работают {rep['alive']} из {rep['checked']}" if rep["checked"] else (
+            f"+{rep['added']} новых" if rep["added"] else "без изменений")
+        if rep["connected"]:
+            short += " · лучший подключён"
+        self.set_setting("pilot_last_ts", time.time())
+        self.set_setting("pilot_last_short", short)
+
+        def show():
+            if manual:
+                act = _activity()
+                if act is None:
+                    BulletinHelper.show_info("Автопилот: " + short)
+                    return
+                try:
+                    b = _dialog_builder(act)
+                    b.setTitle("Автопилот завершён")
+                    b.setMessage(text)
+                    b.setPositiveButton("Закрыть", _DialogClick())
+                    b.setNeutralButton("Открыть список", _DialogClick(lambda w: self._open_proxy_list()))
+                    b.show()
+                except Exception as e:
+                    _log(f"pilot dialog: {e}")
+                    BulletinHelper.show_info("Автопилот: " + short)
+            elif self.get_setting("notify_auto", True):
+                BulletinHelper.show_info("Автопилот: " + short)
+
+        run_on_ui_thread(show)
+
+    # ── планировщик ─────────────────────────────────────────────────
+
+    def _start_scheduler(self):
+        def loop():
+            time.sleep(12)
+            while self._running:
+                try:
+                    if self.get_setting("auto_enabled", True):
+                        minutes = self._interval_minutes()
+                        last = float(self.get_setting("last_run", 0) or 0)
+                        due = (time.time() - last) >= minutes * 60
+                        use_pilot = bool(self.get_setting("pilot_on_timer", False))
+                        has_src = bool(self._sources() or self._web_sources())
+                        if due and not self._busy and (has_src or use_pilot):
+                            if use_pilot:
+                                if self._pilot_begin():
+                                    self.set_setting("last_run", time.time())
+                                    self._pilot_run(manual=False)
+                            else:
+                                self._collect(manual=False)
+                except Exception as e:
+                    _log(f"scheduler: {e}")
+                for _ in range(10):
+                    if not self._running:
+                        return
+                    time.sleep(2)
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    # ── сбор из каналов ─────────────────────────────────────────────
+
+    def _request_sync(self, req, timeout=25):
+        done = threading.Event()
+        box = {}
+
+        def cb(resp, err):
+            box["r"], box["e"] = resp, err
+            done.set()
+
+        send_request(req, cb)
+        done.wait(timeout)
+        return box.get("r"), box.get("e")
+
+    def _resolve_peer(self, src):
+        if src["kind"] == "dialog":
+            ctrl = MessagesController.getInstance(UserConfig.selectedAccount)
+            return ctrl.getInputPeer(int(src["id"]))
+        name = src["name"].lower()
+        if name in self._peer_cache:
+            return self._peer_cache[name]
+        req = TLRPC.TL_contacts_resolveUsername()
+        req.username = src["name"]
+        resp, err = self._request_sync(req)
+        if err or resp is None:
+            return None
+        chats = getattr(resp, "chats", None)
+        if chats is None or chats.size() == 0:
+            return None
+        ch = chats.get(0)
+        peer = TLRPC.TL_inputPeerChannel()
+        peer.channel_id = ch.id
+        peer.access_hash = ch.access_hash
+        self._peer_cache[name] = peer
+        return peer
+
+    def _extract_links(self, msg):
+        texts = []
+        try:
+            if getattr(msg, "message", None):
+                texts.append(str(msg.message))
+        except Exception:
+            pass
+        try:
+            ents = getattr(msg, "entities", None)
+            if ents is not None:
+                for i in range(ents.size()):
+                    url = getattr(ents.get(i), "url", None)
+                    if url:
+                        texts.append(str(url))
+        except Exception:
+            pass
+        try:
+            markup = getattr(msg, "reply_markup", None)
+            if markup is not None and hasattr(markup, "rows"):
+                for r in range(markup.rows.size()):
+                    row = markup.rows.get(r)
+                    for b in range(row.buttons.size()):
+                        url = getattr(row.buttons.get(b), "url", None)
+                        if url:
+                            texts.append(str(url))
+        except Exception:
+            pass
+        links = []
+        for t in texts:
+            links.extend(PROXY_LINK_RE.findall(t))
+        return links
+
+    def _fetch_source(self, src, min_id, limit):
+        peer = self._resolve_peer(src)
+        if peer is None:
+            return None, "не найден"
+        topic = int(src.get("topic") or 0)
+        if topic > 0:
+            req = TLRPC.TL_messages_getReplies()
+            req.peer = peer
+            req.msg_id = topic
+        else:
+            req = TLRPC.TL_messages_getHistory()
+            req.peer = peer
+        req.offset_id = 0
+        req.offset_date = 0
+        req.add_offset = 0
+        req.limit = limit
+        req.min_id = int(min_id)
+        req.max_id = 0
+        req.hash = 0
+        resp, err = self._request_sync(req)
+        if err:
+            return None, str(getattr(err, "text", err))
+        msgs = getattr(resp, "messages", None)
+        if msgs is None:
+            return [], None
+        return _jlist(msgs), None
+
+    def _collect(self, manual=False, quiet=False):
+        if not self._collect_lock.acquire(blocking=False):
+            if manual:
+                run_on_ui_thread(lambda: BulletinHelper.show_info("Сбор уже идёт…"))
+            return
+        self._busy = True
+        try:
+            sources = self._sources()
+            web_urls = self._web_sources() if self.get_setting("web_enabled", True) else []
+            if not sources and not web_urls:
+                if manual and not quiet:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error("Добавьте канал или веб-ссылку в «Источниках»"))
+                return None
+
+            only_new = bool(self.get_setting("only_new", True))
+            try:
+                limit = int(str(self.get_setting("scan_limit", "100")).strip())
+            except Exception:
+                limit = 100
+            limit = max(10, min(limit, 100))
+            try:
+                state = json.loads(self.get_setting("src_state", "{}"))
+            except Exception:
+                state = {}
+
+            seen = _existing_keys()
+            found = added = dups = bad = errors = 0
+
+            for src in sources:
+                try:
+                    min_id = state.get(src["key"], 0) if only_new else 0
+                    msgs, err = self._fetch_source(src, min_id, limit)
+                    if err:
+                        errors += 1
+                        _log(f"source {src['key']}: {err}")
+                        continue
+                    max_id = min_id
+                    for msg in msgs:
+                        try:
+                            max_id = max(max_id, int(msg.id))
+                        except Exception:
+                            pass
+                        for link in self._extract_links(msg):
+                            found += 1
+                            res = _add_link(link, seen)
+                            if res == "added":
+                                added += 1
+                            elif res == "dup":
+                                dups += 1
+                            else:
+                                bad += 1
+                    if only_new and max_id > min_id:
+                        state[src["key"]] = max_id
+                except Exception as e:
+                    errors += 1
+                    _log(f"source error {src.get('key')}: {e}")
+
+            for url in web_urls:
+                try:
+                    text = fetch_web_text(url)
+                    for link in extract_proxy_links(text):
+                        found += 1
+                        res = _add_link(link, seen)
+                        if res == "added":
+                            added += 1
+                        elif res == "dup":
+                            dups += 1
+                        else:
+                            bad += 1
+                except Exception as e:
+                    errors += 1
+                    _log(f"web source {url}: {e}")
+
+            if added:
+                _save_proxies()
+                _notify_proxies_changed()
+
+            self.set_setting("src_state", json.dumps(state))
+            self.set_setting("last_run", time.time())
+            summary = f"+{added} новых · дублей {dups} · найдено {found}"
+            if errors:
+                summary += f" · ошибок {errors}"
+            self.set_setting("last_summary", summary)
+
+            if (manual or self.get_setting("notify_auto", True)) and not quiet:
+                msg_txt = f"Proxy Hub: добавлено {added}, дублей {dups}" + (f", ошибок {errors}" if errors else "")
+                if added:
+                    run_on_ui_thread(lambda: BulletinHelper.show_success(msg_txt))
+                else:
+                    run_on_ui_thread(lambda: BulletinHelper.show_info(msg_txt if found else "Новых прокси не найдено"))
+            self._refresh_settings()
+            return {"found": found, "added": added, "dups": dups, "bad": bad, "errors": errors}
+        except Exception as e:
+            _log(f"collect: {e}")
+            if manual and not quiet:
+                run_on_ui_thread(lambda m=str(e): BulletinHelper.show_error(f"Ошибка сбора: {m}"))
+            return None
+        finally:
+            self._busy = False
+            self._collect_lock.release()
+
+    # ── действия: инструменты ───────────────────────────────────────
+
+    def _act_collect(self):
+        BulletinHelper.show_info("Собираю прокси из источников…")
+        self._bg(self._collect, True)
+
+    def _act_reset_state(self):
+        self.set_setting("src_state", "{}")
+        BulletinHelper.show_success("Позиция чтения сброшена — следующий сбор просмотрит последние сообщения заново")
+
+    def _act_import_clipboard(self):
+        def ui():
+            try:
+                clip = ApplicationLoader.applicationContext.getSystemService("clipboard")
+                if not clip or not clip.hasPrimaryClip():
+                    BulletinHelper.show_error("Буфер обмена пуст")
+                    return
+                raw = str(clip.getPrimaryClip().getItemAt(0).getText() or "")
+                links = PROXY_LINK_RE.findall(raw)
+                if not links:
+                    BulletinHelper.show_error("Прокси-ссылок не найдено")
+                    return
+                seen = _existing_keys()
+                added = dups = 0
+                for l in links:
+                    r = _add_link(l, seen)
+                    if r == "added":
+                        added += 1
+                    elif r == "dup":
+                        dups += 1
+                if added:
+                    _save_proxies()
+                    _notify_proxies_changed()
+                    BulletinHelper.show_success(f"Импортировано: {added}" + (f" (дублей: {dups})" if dups else ""))
+                else:
+                    BulletinHelper.show_info("Новых прокси нет" if dups else "Не удалось распознать прокси")
+            except Exception as e:
+                _log(f"import: {e}")
+                BulletinHelper.show_error(f"Ошибка импорта: {e}")
+
+        run_on_ui_thread(ui)
+
+    def _act_export(self):
+        def task():
+            try:
+                proxies = _proxy_list_snapshot()
+                if not proxies:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error("Список пуст"))
+                    return
+                mt, sk = [], []
+                for p in proxies:
+                    a, po, s, u, pw = _info_fields(p)
+                    if s:
+                        mt.append(f"tg://proxy?server={a}&port={po}&secret={s}")
+                    else:
+                        line = f"tg://socks?server={a}&port={po}"
+                        if u:
+                            line += f"&user={urllib.parse.quote(u)}"
+                        if pw:
+                            line += f"&pass={urllib.parse.quote(pw)}"
+                        sk.append(line)
+                txt = f"Прокси ({len(proxies)}):\n\n"
+                if sk:
+                    txt += "SOCKS5:\n" + "\n".join(sk) + "\n\n"
+                if mt:
+                    txt += "MTProto:\n" + "\n".join(mt)
+                uid = get_user_config().getClientUserId()
+                if len(txt) > 4000:
+                    fp = os.path.join(get_plugins_dir(), "proxies_export.txt")
+                    write_file(fp, txt)
+                    send_document(uid, fp, caption="Экспорт прокси")
+                    run_on_ui_thread(lambda: BulletinHelper.show_success("Экспорт отправлен в Избранное (файл)"))
+                else:
+                    q = TLRPC.TL_messageEntityBlockquote()
+                    q.collapsed = True
+                    q.offset = 0
+                    q.length = len(txt.encode("utf-16-le")) // 2
+                    send_message({"peer": uid, "message": txt, "entities": [q]})
+                    run_on_ui_thread(lambda: BulletinHelper.show_success("Экспорт отправлен в Избранное"))
+            except Exception as e:
+                _log(f"export: {e}")
+                run_on_ui_thread(lambda m=str(e): BulletinHelper.show_error(f"Ошибка экспорта: {m}"))
+
+        self._bg(task)
+
+    def _act_remove_duplicates(self):
+        def ui():
+            try:
+                seen, dups = set(), []
+                for p in _proxy_list_snapshot():
+                    a, po, s, u, pw = _info_fields(p)
+                    k = f"{a}:{po}:{s}:{u}:{pw}"
+                    if k in seen:
+                        dups.append(p)
+                    else:
+                        seen.add(k)
+                if not dups:
+                    BulletinHelper.show_info("Дубликатов нет")
+                    return
+                removed = _delete_proxies(dups)
+                _notify_proxies_changed()
+                if removed:
+                    BulletinHelper.show_success(f"Удалено дублей: {removed}")
+                else:
+                    BulletinHelper.show_error("Не удалось удалить дубликаты")
+            except Exception as e:
+                _log(f"dups: {e}")
+                BulletinHelper.show_error(f"Ошибка: {e}")
+
+        run_on_ui_thread(ui)
+
+    def _act_optimize(self):
+        BulletinHelper.show_info("Оптимизация…")
+
+        def task():
+            try:
+                mod = 0
+                for p in _proxy_list_snapshot():
+                    changed = False
+                    secret = str(getattr(p, "secret", "") or "")
+                    if len(secret) == 32 and all(c in "0123456789abcdefABCDEF" for c in secret):
+                        p.secret = "dd" + secret
+                        changed = True
+                    addr = str(getattr(p, "address", "") or "")
+                    if addr and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", addr):
+                        try:
+                            ip = socket.gethostbyname(addr)
+                            if ip != addr:
+                                p.address = ip
+                                changed = True
+                        except Exception:
+                            pass
+                    if changed:
+                        mod += 1
+                if mod:
+                    _save_proxies()
+                    _notify_proxies_changed()
+                    run_on_ui_thread(lambda: BulletinHelper.show_success(f"Обновлено прокси: {mod}"))
+                else:
+                    run_on_ui_thread(lambda: BulletinHelper.show_success("Всё уже оптимизировано"))
+            except Exception as e:
+                _log(f"optimize: {e}")
+
+        self._bg(task)
+
+    def _act_remove_all(self):
+        proxies = _proxy_list_snapshot()
+        total = len(proxies)
+        if total == 0:
+            BulletinHelper.show_info("Нет прокси для удаления")
+            return
+        frag = get_last_fragment()
+        act = frag.getParentActivity() if frag else None
+        if not act:
+            BulletinHelper.show_error("Не удалось показать окно подтверждения")
+            return
+        b = AlertDialogBuilder(act)
+        b.set_title("Удалить все прокси?")
+        b.set_message(f"Будет удалено прокси: {total}. Сначала лучше сделать экспорт.")
+
+        def on_ok(bld, which):
+            bld.dismiss()
+            try:
+                removed = _delete_proxies(_proxy_list_snapshot())
+                _notify_proxies_changed()
+                if removed:
+                    BulletinHelper.show_success(f"Удалено прокси: {removed}")
+                else:
+                    BulletinHelper.show_error("Не удалось удалить прокси")
+            except Exception as e:
+                BulletinHelper.show_error(f"Ошибка удаления: {e}")
+
+        b.set_positive_button("Удалить", on_ok)
+        b.set_negative_button("Отмена", lambda bld, which: bld.dismiss())
+        b.show()
+
+    def _act_dead_cleanup(self):
+        def after(proxies):
+            dead = [p for p in proxies if not bool(getattr(p, "available", False))]
+            if not dead:
+                BulletinHelper.show_success("Все прокси работают")
+                return
+
+            count = len(dead)
+            dead_keys = {_info_fields(p) for p in dead}
+
+            def delete_dead():
+                current_dead = [
+                    p for p in _proxy_list_snapshot()
+                    if not bool(getattr(p, "available", False)) and _info_fields(p) in dead_keys
+                ]
+                if not current_dead:
+                    BulletinHelper.show_info("Нерабочих прокси больше нет")
+                    return
+                removed = _delete_proxies(current_dead)
+                _notify_proxies_changed()
+                if removed:
+                    BulletinHelper.show_success(f"Удалено нерабочих: {removed}")
+                else:
+                    BulletinHelper.show_error("Не удалось удалить нерабочие прокси")
+
+            if _activity() is None:
+                BulletinHelper.show_error("Не удалось показать подтверждение удаления")
+                return
+            _confirm_dialog(
+                "Удалить нерабочие прокси?",
+                f"Нерабочих прокси: {count}\nБудет удалено: {count}",
+                "Удалить",
+                delete_dead,
+            )
+
+        self._ping_all(on_done=after)
+
+    # ── пинг ────────────────────────────────────────────────────────
+
+    def _act_ping_all(self):
+        self._ping_all()
+
+    def _ping_all(self, on_done=None):
+        if self._ping_busy:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Проверка уже идёт"))
+            return
+        self._ping_busy = True
+        mode = int(self.get_setting("ping_mode", 0))
+
+        def start():
+            proxies = _proxy_list_snapshot()
+            total = len(proxies)
+            if total == 0:
+                BulletinHelper.show_info("Список прокси пуст")
+                self._ping_busy = False
+                return
+            BulletinHelper.show_info(f"Проверка {total} прокси…")
+            for p in proxies:
+                p.checking = True
+            _notify_proxies_changed()
+            self._start_refresh_loop()
+            if mode == 0:
+                self._ping_native(proxies, on_done)
+            else:
+                self._bg(self._ping_tcp, proxies, on_done)
+
+        run_on_ui_thread(start)
+
+    def _finish_ping(self, proxies, on_done):
+        if not self._ping_busy:
+            return
+        self._ping_busy = False
+        _save_proxies()
+        _notify_proxies_changed()
+        ok = sum(1 for p in proxies if p.available)
+        if on_done:
+            try:
+                on_done(proxies)
+            except Exception as e:
+                _log(f"ping on_done: {e}")
+        else:
+            self._show_ping_result(proxies, ok)
+
+    @staticmethod
+    def _mark(p, ms):
+        p.checking = False
+        p.availableCheckTime = SystemClock.elapsedRealtime()
+        if ms is None or ms < 0:
+            p.available = False
+            p.ping = 0
+        else:
+            p.available = True
+            p.ping = int(ms)
+        try:
+            NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.proxyCheckDone, p)
+        except Exception:
+            pass
+
+    def _ping_native(self, proxies, on_done):
+        cm = ConnectionsManager.getInstance(UserConfig.selectedAccount)
+        st = {"n": len(proxies), "done": False}
+
+        def finish():
+            if st["done"]:
+                return
+            st["done"] = True
+            self._finish_ping(proxies, on_done)
+
+        def one_done():
+            st["n"] -= 1
+            if st["n"] <= 0:
+                finish()
+
+        def watchdog():
+            # если Telegram не ответил по части прокси — считаем их нерабочими и завершаем
+            time.sleep(45)
+            if st["done"] or not self._ping_busy:
+                return
+
+            def force():
+                for px in proxies:
+                    try:
+                        if getattr(px, "checking", False):
+                            self._mark(px, -1)
+                    except Exception:
+                        pass
+                finish()
+
+            run_on_ui_thread(force)
+
+        threading.Thread(target=watchdog, daemon=True).start()
+
+        for px in proxies:
+            a, po, s_, u, pw = _info_fields(px)
+            if not a:
+                run_on_ui_thread(lambda p=px: (self._mark(p, -1), one_done()))
+                continue
+
+            def make_cb(p):
+                def on_time(t):
+                    run_on_ui_thread(lambda: (self._mark(p, -1 if t == -1 else t), one_done()))
+                return on_time
+
+            try:
+                cm.checkProxy(a, po, u, pw, s_, _NativeTimeDelegate(make_cb(px)))
+            except Exception as e:
+                _log(f"checkProxy {a}: {e}")
+                run_on_ui_thread(lambda p=px: (self._mark(p, -1), one_done()))
+
+    def _tcp_ms(self, p):
+        a, po, _, _, _ = _info_fields(p)
+        if not a or not po:
+            return -1
+        t0 = time.time()
+        try:
+            with socket.create_connection((a, po), timeout=5.0):
+                return int((time.time() - t0) * 1000)
+        except OSError:
+            return -1
+
+    def _ping_tcp(self, proxies, on_done):
+        def check(px):
+            ms = self._tcp_ms(px)
+            run_on_ui_thread(lambda: self._mark(px, ms))
+
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            list(pool.map(check, proxies))
+        run_on_ui_thread(lambda: self._finish_ping(proxies, on_done))
+
+    def _start_refresh_loop(self):
+        def loop():
+            while self._ping_busy and self._running:
+                time.sleep(1.0)
+                run_on_ui_thread(self._force_refresh_cells)
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    def _force_refresh_cells(self):
+        try:
+            fr = get_last_fragment()
+            if fr is None or "ProxyListActivity" not in fr.getClass().getName():
+                return
+            ad = get_private_field(fr, "listAdapter")
+            if ad is not None:
+                ad.notifyDataSetChanged()
+        except Exception:
+            pass
+
+    def _act_sort_by_ping(self):
+        def ui():
+            try:
+                SharedConfig.loadProxyList()
+                al = SharedConfig.proxyList
+                items = _jlist(al)
+                if len(items) <= 1:
+                    return
+
+                def sk(i):
+                    av = bool(getattr(i, "available", False))
+                    p = int(getattr(i, "ping", 0) or 0)
+                    return (1, 10 ** 9) if (not av or p <= 0) else (0, p)
+
+                items.sort(key=sk)
+                al.clear()
+                for it in items:
+                    al.add(it)
+                _save_proxies()
+                _notify_proxies_changed()
+                BulletinHelper.show_success("Отсортировано по пингу")
+            except Exception as e:
+                _log(f"sort: {e}")
+
+        run_on_ui_thread(ui)
+
+    # ── геолокация (флаги + провайдер) ──────────────────────────────
+
+    @staticmethod
+    def _clean_isp(isp):
+        isp = re.sub(r"(?i)\s+(LLC|Inc\.?|Ltd\.?|Corporation|Corp\.?|Hosting|Network|Communications|GmbH)", "", isp or "").strip(" ,.")
+        return isp[:16] + ".." if len(isp) > 18 else isp
+
+    @staticmethod
+    def _flag(cc):
+        cc = (cc or "").upper()
+        if len(cc) != 2 or not cc.isalpha():
+            return ""
+        return chr(ord(cc[0]) + 127397) + chr(ord(cc[1]) + 127397)
+
+    def _geo_lookup(self, host):
+        """Страна и провайдер для хоста. Только HTTPS-сервисы (HTTP в Android блокируется)."""
+        import requests as req
+
+        try:
+            ip = host if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host) else socket.gethostbyname(host)
+        except Exception:
+            return None
+        cc, isp = "", ""
+        try:
+            r = req.get(f"https://ipwho.is/{ip}?fields=success,country_code,connection", timeout=6).json()
+            if r.get("success"):
+                cc = r.get("country_code") or ""
+                isp = (r.get("connection") or {}).get("isp", "") or ""
+        except Exception as e:
+            _log(f"geo ipwho {ip}: {e}")
+        if not cc:
+            try:
+                r = req.get(f"https://api.country.is/{ip}", timeout=6).json()
+                cc = r.get("country") or ""
+            except Exception as e:
+                _log(f"geo country.is {ip}: {e}")
+        if not cc:
+            try:
+                r = req.get(f"http://ip-api.com/json/{ip}?fields=countryCode,isp", timeout=6).json()
+                cc = r.get("countryCode") or ""
+                isp = r.get("isp") or ""
+            except Exception as e:
+                _log(f"geo ip-api {ip}: {e}")
+        flag = self._flag(cc)
+        if not flag:
+            return None
+        return {"flag": flag, "isp": self._clean_isp(isp)}
+
+    def _geo_fetch(self, addr):
+        with self._batch_lock:
+            if addr in self._ip_cache or addr in self._pending_ips:
+                return
+            if time.time() - self._geo_fail.get(addr, 0) < 600:
+                return
+            self._pending_ips.add(addr)
+            if self._geo_active:
+                return
+            self._geo_active = True
+        threading.Thread(target=self._geo_worker, daemon=True).start()
+
+    def _geo_worker(self):
+        try:
+            time.sleep(0.8)
+            while self._running:
+                with self._batch_lock:
+                    ips = list(self._pending_ips)[:60]
+                    for ip in ips:
+                        self._pending_ips.discard(ip)
+                if not ips:
+                    break
+                with ThreadPoolExecutor(max_workers=6) as pool:
+                    results = list(pool.map(self._geo_lookup, ips))
+                changed = False
+                for host, res in zip(ips, results):
+                    if res:
+                        self._ip_cache[host] = res
+                        changed = True
+                    else:
+                        self._geo_fail[host] = time.time()
+                if changed:
+                    self.set_setting("ip_cache", json.dumps(self._ip_cache))
+                    _notify_proxies_changed()
+        except Exception as e:
+            _log(f"geo worker: {e}")
+        finally:
+            with self._batch_lock:
+                self._geo_active = False
+                restart = bool(self._pending_ips) and self._running
+                if restart:
+                    self._geo_active = True
+            if restart:
+                threading.Thread(target=self._geo_worker, daemon=True).start()
+
+    def _act_refresh_geo(self):
+        self._ip_cache = {}
+        self._geo_fail = {}
+        self.set_setting("ip_cache", "{}")
+        for p in _proxy_list_snapshot():
+            addr = _info_fields(p)[0]
+            if addr:
+                self._geo_fetch(addr)
+        BulletinHelper.show_info("Загружаю флаги стран…")
+
+    # ── хуки ────────────────────────────────────────────────────────
+
+    def _install_hooks(self):
+        # Список прокси: кнопки, ячейки
+        try:
+            act_cls = find_class("org.telegram.ui.ProxyListActivity")
+            if act_cls is not None:
+                jc = act_cls.getClass()
+                ctx_cls = find_class("android.content.Context")
+                try:
+                    m = jc.getDeclaredMethod("createView", ctx_cls)
+                    m.setAccessible(True)
+                    self._hook(m, _CreateViewHook(self))
+                except Exception as e:
+                    _log(f"hook createView: {e}")
+                try:
+                    m = jc.getDeclaredMethod("checkProxyList")
+                    m.setAccessible(True)
+                    self._hook(m, _CheckProxyListHook(self))
+                except Exception as e:
+                    _log(f"hook checkProxyList: {e}")
+        except Exception as e:
+            _log(f"hook list: {e}")
+
+        try:
+            cell_cls = find_class("org.telegram.ui.ProxyListActivity$TextDetailProxyCell")
+            if cell_cls is not None:
+                cc = cell_cls.getClass()
+                try:
+                    m = cc.getDeclaredMethod("updateStatus")
+                    m.setAccessible(True)
+                    self._hook(m, _CellUpdateStatusHook(self))
+                except Exception as e:
+                    _log(f"hook updateStatus: {e}")
+                pi = find_class("org.telegram.messenger.SharedConfig$ProxyInfo")
+                if pi is not None:
+                    try:
+                        m = cc.getDeclaredMethod("setProxy", pi)
+                        m.setAccessible(True)
+                        self._hook(m, _CellSetProxyHook(self))
+                    except Exception as e:
+                        _log(f"hook setProxy: {e}")
+        except Exception as e:
+            _log(f"hook cells: {e}")
+
+        # Скрытие спонсорского прокси
+        try:
+            m = self._find_dialogs_array_method()
+            if m is not None:
+                self._hook(m, _SponsorHook(self), priority=100)
+        except Exception as e:
+            _log(f"hook sponsor: {e}")
+
+        # Нормализация TLS-секретов
+        try:
+            self._install_secret_hooks()
+        except Exception as e:
+            _log(f"hook secrets: {e}")
+
+    def _find_dialogs_array_method(self):
+        cls = find_class("org.telegram.ui.DialogsActivity")
+        if cls is None:
+            return None
+        candidates = [cls]
+        try:
+            k = cls.getClass()
+            if k is not None and k is not cls:
+                candidates.append(k)
+        except Exception:
+            pass
+        for c in candidates:
+            try:
+                methods = list(c.getDeclaredMethods())
+            except Exception:
+                continue
+            for m in methods:
+                try:
+                    if m.getName() != "getDialogsArray":
+                        continue
+                    pt = m.getParameterTypes()
+                    try:
+                        n = len(pt)
+                    except Exception:
+                        n = int(pt.length)
+                    if n != 4:
+                        continue
+                    m.setAccessible(True)
+                    return m
+                except Exception:
+                    continue
+        return None
+
+    def _install_secret_hooks(self):
+        from java.lang import Boolean, Integer
+
+        cmgr = find_class("org.telegram.tgnet.ConnectionsManager")
+        string_class = find_class("java.lang.String")
+        rtd = find_class("org.telegram.tgnet.RequestTimeDelegate")
+        if not cmgr or not string_class or not rtd:
+            return
+        specs = [
+            ("setProxySettings", [Boolean.TYPE, string_class, Integer.TYPE, string_class, string_class, string_class], 5),
+            ("checkProxy", [string_class, Integer.TYPE, string_class, string_class, string_class, rtd], 4),
+            ("native_setProxySettings", [Integer.TYPE, string_class, Integer.TYPE, string_class, string_class, string_class], 5),
+            ("native_checkProxy", [Integer.TYPE, string_class, Integer.TYPE, string_class, string_class, string_class, rtd], 5),
+        ]
+        for name, params, idx in specs:
+            try:
+                m = cmgr.getClass().getDeclaredMethod(name, *params)
+                m.setAccessible(True)
+                self._hook(m, _SecretHook(self, idx), priority=10)
+            except Exception as e:
+                _log(f"secret hook {name}: {e}")
+
+    def _add_action_buttons(self, fragment):
+        try:
+            ab = get_private_field(fragment, "actionBar")
+            if ab is None:
+                return
+            menu = ab.createMenu()
+            iw = AndroidUtilities.dp(40)
+            specs = [
+                (MENU_EXPORT_ID, "btn_export", R_tg.drawable.msg_share, "Экспорт", lambda _v: self._act_export()),
+                (MENU_IMPORT_ID, "btn_import", R_tg.drawable.msg_download, "Импорт", lambda _v: self._act_import_clipboard()),
+                (MENU_SORT_ID, "btn_sort", R_tg.drawable.msg_list, "По пингу", lambda _v: self._act_sort_by_ping()),
+                (MENU_PING_ID, "btn_ping", R_tg.drawable.msg_recent, "Пинг все", lambda _v: self._act_ping_all()),
+            ]
+            for mid, key, icon, title, fn in specs:
+                if self.get_setting(key, True) and menu.getItem(mid) is None:
+                    it = menu.addItemWithWidth(mid, icon, iw, title)
+                    it.setOnClickListener(OnClickListener(fn))
+        except Exception as e:
+            _log(f"action buttons: {e}")
+
+    # ── настройки (UI) ──────────────────────────────────────────────
+
+    def create_settings(self) -> List[Any]:
+        tab = int(self.get_setting("ui_tab", TAB_SOURCES))
+        items: List[Any] = [
+            Custom(factory=HEADER_FACTORY.instance.java),
+            Custom(factory=CARDS_FACTORY.instance.java),
+        ]
+        builders = {
+            TAB_SOURCES: self._tab_sources,
+            TAB_TIMER: self._tab_timer,
+            TAB_TOOLS: self._tab_tools,
+            TAB_VIEW: self._tab_view,
+            TAB_WL: self._tab_wl,
+        }
+        items += builders.get(tab, self._tab_sources)()
+        items += [
+            Divider(),
+            Header(text="О плагине"),
+            Text(
+                text="Информация о Proxy Hub",
+                subtext="Версия " + __version__ + " · нажмите, чтобы посмотреть",
+                icon="msg_info",
+                on_click=lambda v: self._show_about(),
+            ),
+        ]
+        return items
+
+    def _show_about(self):
+        act = _activity()
+        if act is None:
+            BulletinHelper.show_error("Не удалось открыть информацию о плагине")
+            return
+        message = (
+            f"Версия: {__version__}\n"
+            f"Автор: {__author__}\n\n"
+            "Proxy Hub собирает прокси из Telegram и веб-источников, "
+            "проверяет их доступность, управляет списком, а также показывает "
+            "сведения о подключении и результат проверки белых списков."
+        )
+        try:
+            builder = _dialog_builder(act)
+            builder.setTitle("О Proxy Hub")
+            builder.setMessage(message)
+            builder.setPositiveButton("Закрыть", _DialogClick())
+            builder.show()
+        except Exception as e:
+            _log(f"about dialog: {e}")
+            BulletinHelper.show_error(f"Не удалось показать информацию: {e}")
+
+    def _tab_sources(self):
+        n = len(self._sources())
+        w = len(self._web_sources())
+        last = _fmt_time(self.get_setting("last_run", 0))
+        summary = str(self.get_setting("last_summary", "") or "")
+        return [
+            Header(text="Источники"),
+            Custom(factory=SRC_FACTORY.instance.java),
+            Text(text="Добавить источник", icon="msg_add", accent=True, on_click=lambda v: self._act_add_source()),
+            Text(text="Импорт из буфера обмена", icon="msg_download", on_click=lambda v: self._act_import_sources()),
+            Text(text="Экспорт списка в буфер", icon="msg_copy", on_click=lambda v: self._act_export_sources()),
+            Divider(
+                text="Для источника Telegram нажмите или зажмите строку — можно открыть чат/канал, проверить его, "
+                     "получить прокси или удалить источник. Принимаются @username, t.me/…, t.me/c/ID, ссылки на "
+                     "сайты, GitHub, JSON и base64-подписки. Чат также можно добавить через меню «⋮» внутри чата."
+            ),
+            Header(text="Веб-источники"),
+            Switch(
+                key="web_enabled",
+                text="Собирать с сайтов и репозиториев",
+                default=True,
+                icon="msg_link",
+            ),
+            Header(text="Параметры сбора"),
+            Switch(
+                key="only_new",
+                text="Только новые сообщения",
+                subtext="Запоминает, до какого сообщения дошёл в каждом канале",
+                default=True,
+                icon="msg_recent",
+            ),
+            Input(
+                key="scan_limit",
+                text="Сообщений за проход",
+                default="100",
+                subtext="От 10 до 100",
+                icon="msg_list",
+            ),
+            Divider(),
+            Header(text="Статус"),
+            Text(
+                text=f"Источников: Telegram {n} · веб {w}",
+                subtext=f"Последний сбор: {last}" + (f"\n{summary}" if summary else ""),
+                icon="msg_info",
+            ),
+            Text(text="Собрать сейчас", icon="msg_download", accent=True, on_click=lambda v: self._act_collect()),
+            Text(text="Сбросить позицию чтения", icon="msg_retry", on_click=lambda v: self._act_reset_state()),
+        ]
+
+    def _tab_wl(self):
+        return [
+            Custom(factory=WL_FACTORY.instance.java),
+            Divider(
+                text="Проверка идёт напрямую, без прокси Telegram: приложение пробует установить защищённое "
+                     "соединение с сайтами из трёх групп. Белый список — крупные российские сервисы; если они открываются, "
+                     "а российские «обычные» и зарубежные сайты нет — скорее всего, включены белые списки. "
+                     "Для точного результата отключите VPN. Идея была взята с проекта на github Aleksey-Kon/white-list-test."
+            ),
+        ]
+
+    def _tab_timer(self):
+        idx = int(self.get_setting("interval_idx", DEFAULT_INTERVAL_IDX))
+        items = [
+            Header(text="Автосбор"),
+            Switch(
+                key="auto_enabled",
+                text="Собирать автоматически",
+                default=True,
+                subtext=self._next_run_text(),
+                icon="msg_recent",
+                on_change=lambda v: self.set_setting("ui_refresh", time.time(), reload_settings=True),
+            ),
+            Selector(
+                key="interval_idx",
+                text="Интервал",
+                default=DEFAULT_INTERVAL_IDX,
+                items=INTERVAL_LABELS,
+                icon="msg_list",
+                on_change=lambda i: self.set_setting("ui_refresh", time.time(), reload_settings=True),
+            ),
+        ]
+        if idx == len(INTERVAL_MINUTES) - 1:
+            items.append(
+                Input(
+                    key="custom_minutes",
+                    text="Свой интервал, минут",
+                    default="60",
+                    subtext="Минимум 5",
+                    icon="msg_edit",
+                    on_change=lambda v: self.set_setting("ui_refresh", time.time(), reload_settings=True),
+                )
+            )
+        items += [
+            Divider(text="Таймер работает, пока запущено приложение. Последний сбор: " + _fmt_time(self.get_setting("last_run", 0))),
+            Header(text="Уведомления"),
+            Switch(
+                key="notify_auto",
+                text="Показывать результат автосбора",
+                default=True,
+                icon="msg_info",
+            ),
+            Divider(),
+            Text(text="Собрать сейчас", icon="msg_download", accent=True, on_click=lambda v: self._act_collect()),
+        ]
+        return items
+
+    def _tab_tools(self):
+        count = len(_proxy_list_snapshot())
+        return [
+            Custom(factory=PILOT_FACTORY.instance.java),
+            Divider(
+                text="Одна кнопка вместо десяти: плагин сам соберёт прокси, уберёт дубликаты и нерабочие, "
+                     "отсортирует по пингу и подключит самый быстрый. Повторное нажатие во время работы останавливает "
+                     "автопилот. Если не ответил ни один прокси (например, нет интернета), ничего не удаляется."
+            ),
+            Header(text="Шаги автопилота"),
+            Switch(key="pilot_collect", text="Собирать из источников", default=True, icon="msg_download"),
+            Switch(key="pilot_dedupe", text="Удалять дубликаты", default=True, icon="msg_clear"),
+            Switch(key="pilot_clean", text="Удалять нерабочие", default=True, icon="msg_delete"),
+            Switch(key="pilot_sort", text="Сортировать по пингу", default=True, icon="msg_list"),
+            Switch(
+                key="pilot_connect",
+                text="Подключать самый быстрый",
+                subtext="При автозапуске по таймеру не меняет прокси, если текущий жив",
+                default=True,
+                icon="msg_link",
+            ),
+            Switch(
+                key="pilot_optimize",
+                text="Оптимизировать (IP + dd)",
+                subtext="Меняет домены на IP и секреты на dd — по умолчанию выключено",
+                default=False,
+                icon="msg_settings",
+            ),
+            Input(
+                key="pilot_keep_top",
+                text="Оставить только N лучших",
+                default="0",
+                subtext="0 — не ограничивать; остальные рабочие прокси будут удалены",
+                icon="msg_list",
+            ),
+            Divider(),
+            Header(text="Автоматически"),
+            Switch(
+                key="pilot_on_timer",
+                text="Запускать автопилот по таймеру",
+                subtext="Вместо простого автосбора. Интервал — во вкладке «Таймер»",
+                default=False,
+                icon="msg_recent",
+            ),
+            Divider(),
+            Header(text=f"Список прокси ({count})"),
+            Text(text="Проверить пинг всех", icon="msg_recent", on_click=lambda v: self._act_ping_all()),
+            Text(text="Сортировать по пингу", icon="msg_list", on_click=lambda v: self._act_sort_by_ping()),
+            Text(text="Удалить нерабочие", icon="msg_clear", on_click=lambda v: self._act_dead_cleanup()),
+            Text(text="Удалить дубликаты", icon="msg_clear", on_click=lambda v: self._act_remove_duplicates()),
+            Text(
+                text="Оптимизировать (IP + dd)",
+                subtext="Домены → IP, секреты → dd",
+                icon="msg_settings",
+                on_click=lambda v: self._act_optimize(),
+            ),
+            Text(
+                text="Обновить флаги стран",
+                subtext="Заново определить страну и провайдера",
+                icon="msg_location",
+                on_click=lambda v: self._act_refresh_geo(),
+            ),
+            Divider(),
+            Header(text="Импорт и экспорт"),
+            Text(text="Импорт из буфера обмена", icon="msg_download", on_click=lambda v: self._act_import_clipboard()),
+            Text(text="Экспорт в Избранное", icon="msg_share", on_click=lambda v: self._act_export()),
+            Divider(),
+            Text(text="Удалить все прокси", icon="msg_delete", red=True, on_click=lambda v: self._act_remove_all()),
+        ]
+
+    def _tab_view(self):
+        return [
+            Header(text="Пинг"),
+            Selector(
+                key="ping_mode",
+                text="Режим проверки",
+                default=0,
+                items=["Нативный (Telegram)", "TCP"],
+                icon="msg_settings",
+            ),
+            Divider(text="TCP проверяет только доступность порта; нативный — реальное подключение через Telegram."),
+            Header(text="Отображение в списке"),
+            Switch(key="show_geo", text="Флаги стран и провайдер", default=True, icon="msg_location"),
+            Switch(key="show_type", text="Метка MTProto / SOCKS5", default=True, icon="msg_info"),
+            Divider(),
+            Header(text="Кнопки в шапке списка"),
+            Switch(key="btn_ping", text="Пинг все", default=True, icon="msg_recent"),
+            Switch(key="btn_sort", text="Сортировка", default=True, icon="msg_list"),
+            Switch(key="btn_import", text="Импорт", default=True, icon="msg_download"),
+            Switch(key="btn_export", text="Экспорт", default=True, icon="msg_share"),
+            Divider(text="Изменения кнопок применяются при следующем открытии списка прокси."),
+            Header(text="Дополнительно"),
+            Switch(
+                key="hide_sponsor",
+                text="Скрывать спонсорский прокси",
+                subtext="Убирает рекламный канал из списка чатов",
+                default=True,
+                icon="msg_block",
+            ),
+            Switch(
+                key="normalize_secret",
+                text="Нормализовать секреты MTProxy",
+                subtext="Приводит секрет к hex в нижнем регистре (в т.ч. ee/TLS)",
+                default=True,
+                icon="msg_settings",
+            ),
+        ]
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Хуки
+# ════════════════════════════════════════════════════════════════════
+
+class _CreateViewHook(MethodHook):
+    def __init__(self, plg):
+        self._p = plg
+
+    def after_hooked_method(self, param):
+        self._p._add_action_buttons(param.thisObject)
+
+
+class _CheckProxyListHook(MethodHook):
+    def __init__(self, plg):
+        self._p = plg
+
+    def before_hooked_method(self, param):
+        try:
+            if int(self._p.get_setting("ping_mode", 0)) != 0:
+                param.setResult(None)
+        except Exception as e:
+            _log(f"checkProxyList hook: {e}")
+
+
+class _CellSetProxyHook(MethodHook):
+    def __init__(self, plg):
+        self._p = plg
+
+    def after_hooked_method(self, param):
+        try:
+            info = param.args[0]
+            if not info or not self._p.get_setting("show_geo", True):
+                return
+            addr = _info_fields(info)[0]
+            tv = get_private_field(param.thisObject, "textView")
+            if tv is None or not addr:
+                return
+            d = self._p._ip_cache.get(addr)
+            if d:
+                flag = d.get("flag", "")
+                if flag:
+                    tv.setText(f"{flag} {addr}:{info.port}")
+            else:
+                self._p._geo_fetch(addr)
+        except Exception as e:
+            _log(f"setProxy hook: {e}")
+
+
+class _CellUpdateStatusHook(MethodHook):
+    def __init__(self, plg):
+        self._p = plg
+
+    def after_hooked_method(self, param):
+        try:
+            cell = param.thisObject
+            info = get_private_field(cell, "currentInfo")
+            if not info:
+                return
+            vv = get_private_field(cell, "valueTextView")
+            if vv is None:
+                return
+            addr, _, secret, _, _ = _info_fields(info)
+            cur = str(vv.getText() or "")
+            parts = []
+            if self._p.get_setting("show_type", True):
+                label = "MTProto" if secret else "SOCKS5"
+                if label not in cur:
+                    parts.append(label)
+            if self._p.get_setting("show_geo", True):
+                d = self._p._ip_cache.get(addr)
+                isp = d.get("isp", "") if d else ""
+                if isp and isp not in cur:
+                    parts.append(isp)
+                flag = d.get("flag", "") if d else ""
+                tv = get_private_field(cell, "textView")
+                if flag and tv is not None:
+                    t = str(tv.getText() or "")
+                    if t and not t.startswith(flag):
+                        tv.setText(f"{flag} {t}")
+                elif not d and addr:
+                    self._p._geo_fetch(addr)
+            if parts:
+                vv.setText(cur + " · " + " · ".join(parts))
+        except Exception as e:
+            _log(f"updateStatus hook: {e}")
+
+
+class _SponsorHook(MethodHook):
+    def __init__(self, plg):
+        self._p = plg
+
+    def after_hooked_method(self, param):
+        try:
+            if not self._p.get_setting("hide_sponsor", True):
+                return
+            result = param.getResult()
+            if result is None:
+                return
+            size = int(result.size())
+            if size <= 0:
+                return
+            try:
+                account = int(param.thisObject.getCurrentAccount())
+            except Exception:
+                account = int(UserConfig.selectedAccount)
+            mc = MessagesController.getInstance(account)
+            try:
+                if int(mc.promoDialogType) != int(MessagesController.PROMO_TYPE_PROXY):
+                    return
+            except Exception:
+                return
+
+            def is_promo(item):
+                try:
+                    did = int(item.id)
+                    return did != 0 and bool(mc.isPromoDialog(did, False))
+                except Exception:
+                    return False
+
+            items = [result.get(i) for i in range(size)]
+            if not any(it is not None and is_promo(it) for it in items):
+                return
+            from java.util import ArrayList
+
+            filtered = ArrayList()
+            for it in items:
+                if it is not None and not is_promo(it):
+                    filtered.add(it)
+            param.setResult(filtered)
+        except Exception as e:
+            _log(f"sponsor hook: {e}")
+
+
+_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+
+
+def _decode_secret(raw):
+    compact = "".join(ch for ch in raw if not ch.isspace())
+    if not compact:
+        return compact, None
+    if _HEX_RE.fullmatch(compact) and len(compact) % 2 == 0:
+        try:
+            return compact, bytes.fromhex(compact)
+        except ValueError:
+            return compact, None
+    padded = compact.replace("-", "+").replace("_", "/")
+    padded += "=" * ((4 - len(padded) % 4) % 4)
+    try:
+        return compact, base64.b64decode(padded, validate=False)
+    except (ValueError, binascii.Error):
+        return compact, None
+
+
+class _SecretHook(MethodHook):
+    def __init__(self, plg, secret_index):
+        self._p = plg
+        self._i = secret_index
+
+    def before_hooked_method(self, param):
+        try:
+            if not self._p.get_setting("normalize_secret", True):
+                return
+            raw_value = param.args[self._i]
+            if raw_value is None:
+                return
+            raw = str(raw_value)
+            compact, decoded = _decode_secret(raw)
+            if decoded is None:
+                return
+            hex_value = decoded.hex()
+            if raw != hex_value:
+                param.args[self._i] = hex_value
+        except Exception:
+            return
+
+
+# ════════════════════════════════════════════════════════════════════
+#  UI настроек в стиле карточек (шапка + сетка 2×2)
+# ════════════════════════════════════════════════════════════════════
+
+_LP = None
+
+
+def _lp(w, h, weight=None):
+    LP = jclass("android.widget.LinearLayout$LayoutParams")
+    return LP(w, h, weight) if weight is not None else LP(w, h)
+
+
+def _rounded(color_int, radius_dp, stroke_dp=0, stroke_color=0):
+    GD = jclass("android.graphics.drawable.GradientDrawable")
+    gd = GD()
+    gd.setColor(color_int)
+    gd.setCornerRadius(float(_dp(radius_dp)))
+    if stroke_dp:
+        gd.setStroke(_dp(stroke_dp), stroke_color)
+    return gd
+
+
+def _res_id(ctx, name):
+    """Ищет иконку по имени; name может быть строкой или списком запасных имён."""
+    names = [name] if isinstance(name, str) else list(name)
+    for n in names:
+        try:
+            rid = int(getattr(R_tg.drawable, n))
+            if rid:
+                return rid
+        except Exception:
+            pass
+        try:
+            rid = int(ctx.getResources().getIdentifier(n, "drawable", ctx.getPackageName()))
+            if rid:
+                return rid
+        except Exception:
+            pass
+    return 0
+
+
+def _bold_face():
+    try:
+        return AndroidUtilities.bold()
+    except Exception:
+        try:
+            return AndroidUtilities.getTypeface("fonts/rmedium.ttf")
+        except Exception:
+            return None
+
+
+def _text(ctx, text, size_sp, color, bold=False):
+    from android.widget import TextView
+
+    tv = TextView(ctx)
+    tv.setText(text)
+    tv.setTextSize(1, size_sp)
+    tv.setTextColor(color)
+    if bold:
+        face = _bold_face()
+        if face is not None:
+            tv.setTypeface(face)
+    return tv
+
+
+def _set_row_params(root):
+    try:
+        RLP = jclass("androidx.recyclerview.widget.RecyclerView$LayoutParams")
+        root.setLayoutParams(RLP(-1, -2))
+    except Exception:
+        pass
+
+
+def _noop_bind(view, item, divider, adapter, list_view):
+    return None
+
+
+def _create_header(context, list_view, current_account, class_guid, resources_provider):
+    from android.widget import FrameLayout, ImageView, LinearLayout
+
+    GD = jclass("android.graphics.drawable.GradientDrawable")
+    Orientation = jclass("android.graphics.drawable.GradientDrawable$Orientation")
+
+    outer = LinearLayout(context)
+    outer.setOrientation(1)
+    outer.setPadding(_dp(12), _dp(8), _dp(12), _dp(4))
+
+    card = LinearLayout(context)
+    card.setOrientation(1)
+    card.setGravity(1)  # CENTER_HORIZONTAL
+    card.setPadding(_dp(16), _dp(28), _dp(16), _dp(24))
+    try:
+        grad = GD(Orientation.TL_BR, jarray(jint)([_color(BRAND_2), _color(BRAND)]))
+    except Exception:
+        grad = _rounded(_color(BRAND), 28)
+    grad.setCornerRadius(float(_dp(28)))
+    card.setBackground(grad)
+
+    badge = FrameLayout(context)
+    circle = GD()
+    circle.setShape(1)  # OVAL
+    circle.setColor(jclass("android.graphics.Color").argb(70, 255, 255, 255))
+    badge.setBackground(circle)
+    FLP = jclass("android.widget.FrameLayout$LayoutParams")
+    try:
+        BackupImageView = jclass("org.telegram.ui.Components.BackupImageView")
+        badge.addView(BackupImageView(context), FLP(_dp(72), _dp(72), 17))  # CENTER
+    except Exception as e:
+        _log(f"sticker view: {e}")
+        icon = ImageView(context)
+        rid = _res_id(context, "msg_proxy")
+        if rid:
+            icon.setImageResource(rid)
+        icon.setColorFilter(_color(HEADER_TEXT))
+        badge.addView(icon, FLP(_dp(44), _dp(44), 17))
+    card.addView(badge, _lp(_dp(88), _dp(88)))
+
+    title = _text(context, "Proxy Hub", 22, _color(HEADER_TEXT), bold=True)
+    tlp = _lp(-2, -2)
+    tlp.setMargins(0, _dp(14), 0, 0)
+    card.addView(title, tlp)
+
+    ver = _text(context, "v" + __version__, 13, _color(HEADER_TEXT))
+    ver.setAlpha(0.7)
+    vlp = _lp(-2, -2)
+    vlp.setMargins(0, _dp(2), 0, 0)
+    card.addView(ver, vlp)
+
+    outer.addView(card, _lp(-1, -2))
+    _set_row_params(outer)
+    return outer
+
+
+def _bind_header(view, item, divider, adapter, list_view):
+    try:
+        sticker = view.getChildAt(0).getChildAt(0).getChildAt(0)
+        MDC = jclass("org.telegram.messenger.MediaDataController")
+        MDC.getInstance(UserConfig.selectedAccount).setPlaceholderImageByIndex(
+            sticker, STICKER_SET, STICKER_INDEX, "130_130"
+        )
+    except Exception as e:
+        _log(f"sticker bind: {e}")
+
+
+HEADER_FACTORY = SimpleSettingFactory(_create_header, _bind_header, is_clickable=False, is_shadow=False)
+
+
+_CARD_DEFS = [
+    ("Источники", "msg_link"),
+    ("Таймер", "msg_recent"),
+    ("Прокси", ["msg_proxy", "msg_proxy_on", "msg_data", "msg_language", "msg_info"]),
+    ("Вид и хуки", "msg_settings"),
+    ("Белые списки", ["msg_stats", "msg_online", "msg_info"]),
+    ("Вкладка с прокси", ["msg_forward", "msg_arrowright", "msg_info"]),
+]
+
+
+def _card_subtitle(idx):
+    p = _PLUGIN
+    if p is None:
+        return ""
+    try:
+        if idx == TAB_SOURCES:
+            return f"{len(p._sources()) + len(p._web_sources())} шт."
+        if idx == TAB_TIMER:
+            return p._timer_label()
+        if idx == TAB_TOOLS:
+            return f"{len(_proxy_list_snapshot())} в списке"
+        if idx == TAB_WL:
+            return "Тест сайтов"
+        if idx == TAB_PROXY_LIST:
+            return "Показывает прокси активированные"
+        return "Параметры"
+    except Exception:
+        return ""
+
+
+def _select_tab(i):
+    if _PLUGIN is None:
+        return
+    if i == TAB_PROXY_LIST:
+        _PLUGIN._open_proxy_list()
+        return
+    _PLUGIN.set_setting("ui_tab", i, reload_settings=True)
+
+
+def _create_cards(context, list_view, current_account, class_guid, resources_provider):
+    from android.widget import ImageView, LinearLayout
+
+    root = LinearLayout(context)
+    root.setOrientation(1)
+    root.setPadding(_dp(8), _dp(4), _dp(8), _dp(8))
+
+    for r in range(3):
+        row = LinearLayout(context)
+        row.setOrientation(0)
+        for c in range(2):
+            idx = r * 2 + c
+            title, icon_name = _CARD_DEFS[idx]
+            card = LinearLayout(context)
+            card.setOrientation(1)
+            card.setPadding(_dp(16), _dp(14), _dp(12), _dp(14))
+            card.setMinimumHeight(_dp(112))
+            card.setClickable(True)
+
+            icon = ImageView(context)
+            rid = _res_id(context, icon_name)
+            if rid:
+                icon.setImageResource(rid)
+            card.addView(icon, _lp(_dp(26), _dp(26)))
+
+            t = _text(context, title, 16, Theme.getColor(Theme.key_windowBackgroundWhiteBlackText), bold=True)
+            t.setSingleLine(True)
+            t.setIncludeFontPadding(False)
+            tl = _lp(-2, -2)
+            tl.setMargins(0, _dp(12), 0, 0)
+            card.addView(t, tl)
+
+            s = _text(context, "", 12, Theme.getColor(Theme.key_windowBackgroundWhiteGrayText2))
+            s.setSingleLine(True)
+            s.setIncludeFontPadding(False)
+            try:
+                s.setEllipsize(jclass("android.text.TextUtils$TruncateAt").END)
+            except Exception:
+                pass
+            sl = _lp(-2, -2)
+            sl.setMargins(0, _dp(3), 0, 0)
+            card.addView(s, sl)
+
+            card.setOnClickListener(OnClickListener(lambda _v, i=idx: _select_tab(i)))
+
+            lp = _lp(0, -2, 1.0)
+            lp.setMargins(_dp(4), _dp(4), _dp(4), _dp(4))
+            row.addView(card, lp)
+        root.addView(row, _lp(-1, -2))
+    _set_row_params(root)
+    return root
+
+
+def _bind_cards(view, item, divider, adapter, list_view):
+    try:
+        p = _PLUGIN
+        selected = int(p.get_setting("ui_tab", TAB_SOURCES)) if p else 0
+        white = Theme.getColor(Theme.key_windowBackgroundWhite)
+        text_c = Theme.getColor(Theme.key_windowBackgroundWhiteBlackText)
+        gray_c = Theme.getColor(Theme.key_windowBackgroundWhiteGrayIcon)
+        brand = _color(BRAND)
+        for r in range(3):
+            row = view.getChildAt(r)
+            for c in range(2):
+                idx = r * 2 + c
+                card = row.getChildAt(c)
+                active = idx == selected and idx != TAB_PROXY_LIST
+                card.setBackground(_rounded(white, 18, 2 if active else 0, brand))
+                icon, title, sub = card.getChildAt(0), card.getChildAt(1), card.getChildAt(2)
+                icon.setColorFilter(brand if active else gray_c)
+                title.setTextColor(brand if active else text_c)
+                sub.setText(_card_subtitle(idx))
+    except Exception as e:
+        _log(f"bind cards: {e}")
+
+
+CARDS_FACTORY = SimpleSettingFactory(_create_cards, _bind_cards, is_clickable=False, is_shadow=False)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Список источников (сворачиваемый, с меню по нажатию / удержанию)
+# ════════════════════════════════════════════════════════════════════
+
+_SRC_UI = {}
+
+
+def _src_toggle():
+    p = _PLUGIN
+    if p is None:
+        return
+    p.set_setting("src_collapsed", not bool(p.get_setting("src_collapsed", False)))
+    _src_apply()
+
+
+def _src_row(ctx, entry):
+    from android.widget import ImageView, LinearLayout
+
+    p = _PLUGIN
+    text_c = Theme.getColor(Theme.key_windowBackgroundWhiteBlackText)
+    sub_c = Theme.getColor(Theme.key_windowBackgroundWhiteGrayText2)
+    gray_c = Theme.getColor(Theme.key_windowBackgroundWhiteGrayIcon)
+
+    row = LinearLayout(ctx)
+    row.setOrientation(0)
+    row.setGravity(16)
+    row.setPadding(_dp(16), _dp(10), _dp(12), _dp(10))
+    row.setClickable(True)
+    try:
+        row.setBackground(Theme.createSelectorDrawable(Theme.getColor(Theme.key_listSelector), 2))
+    except Exception:
+        pass
+
+    icon = ImageView(ctx)
+    names = ["msg_channel", "msg_groups", "msg_link"] if entry["kind"] == "tg" else ["msg_link", "msg_language", "msg_info"]
+    rid = _res_id(ctx, names)
+    if rid:
+        icon.setImageResource(rid)
+    icon.setColorFilter(gray_c)
+    ilp = _lp(_dp(24), _dp(24))
+    ilp.setMargins(0, 0, _dp(14), 0)
+    row.addView(icon, ilp)
+
+    col = LinearLayout(ctx)
+    col.setOrientation(1)
+    title = _text(ctx, entry["title"], 15, text_c)
+    title.setSingleLine(True)
+    title.setIncludeFontPadding(False)
+    sub_txt = entry["label"]
+    st = p._status.get(entry["key"]) if p else None
+    if st:
+        sub_txt += " · " + st
+    sub = _text(ctx, sub_txt, 12, sub_c)
+    sub.setSingleLine(True)
+    sub.setIncludeFontPadding(False)
+    try:
+        trunc = jclass("android.text.TextUtils$TruncateAt").END
+        title.setEllipsize(trunc)
+        sub.setEllipsize(trunc)
+    except Exception:
+        pass
+    col.addView(title, _lp(-1, -2))
+    slp = _lp(-1, -2)
+    slp.setMargins(0, _dp(2), 0, 0)
+    col.addView(sub, slp)
+    row.addView(col, _lp(0, -2, 1.0))
+
+    row.setOnClickListener(OnClickListener(lambda _v, e=entry: p._source_menu(e)))
+    row.setOnLongClickListener(_LongClick(lambda e=entry: p._source_menu(e)))
+    return row
+
+
+def _src_apply():
+    ui = _SRC_UI
+    p = _PLUGIN
+    if not ui or p is None or "root" not in ui:
+        return
+    try:
+        ctx = ui["root"].getContext()
+        ui["card"].setBackground(_rounded(Theme.getColor(Theme.key_windowBackgroundWhite), 18))
+        entries = p._source_entries()
+        collapsed = bool(p.get_setting("src_collapsed", False))
+        ui["title"].setText(f"Список источников · {len(entries)}")
+        ui["title"].setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+        ui["chev"].setText("▸" if collapsed else "▾")
+        ui["chev"].setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayIcon))
+        body = ui["body"]
+        body.removeAllViews()
+        body.setVisibility(8 if collapsed else 0)
+        if collapsed:
+            return
+        if not entries:
+            hint = _text(ctx, "Источников пока нет. Нажмите «Добавить источник».", 13,
+                         Theme.getColor(Theme.key_windowBackgroundWhiteGrayText2))
+            hint.setPadding(_dp(16), _dp(6), _dp(16), _dp(16))
+            body.addView(hint, _lp(-1, -2))
+            return
+        for e in entries:
+            body.addView(_src_row(ctx, e), _lp(-1, -2))
+        pad = _text(ctx, "", 1, 0)
+        body.addView(pad, _lp(-1, _dp(6)))
+    except Exception as e:
+        _log(f"src apply: {e}")
+
+
+def _create_sources(context, list_view, current_account, class_guid, resources_provider):
+    from android.widget import LinearLayout
+
+    root = LinearLayout(context)
+    root.setOrientation(1)
+    root.setPadding(_dp(12), _dp(4), _dp(12), _dp(4))
+
+    card = LinearLayout(context)
+    card.setOrientation(1)
+
+    head = LinearLayout(context)
+    head.setOrientation(0)
+    head.setGravity(16)
+    head.setPadding(_dp(16), _dp(14), _dp(16), _dp(14))
+    head.setClickable(True)
+    title = _text(context, "Список источников", 15, 0, bold=True)
+    head.addView(title, _lp(0, -2, 1.0))
+    chev = _text(context, "▾", 18, 0)
+    head.addView(chev, _lp(-2, -2))
+    head.setOnClickListener(OnClickListener(lambda _v: _src_toggle()))
+    card.addView(head, _lp(-1, -2))
+
+    body = LinearLayout(context)
+    body.setOrientation(1)
+    card.addView(body, _lp(-1, -2))
+
+    root.addView(card, _lp(-1, -2))
+    _set_row_params(root)
+    _SRC_UI.clear()
+    _SRC_UI.update(root=root, card=card, title=title, chev=chev, body=body)
+    return root
+
+
+def _bind_sources(view, item, divider, adapter, list_view):
+    _src_apply()
+
+
+SRC_FACTORY = SimpleSettingFactory(_create_sources, _bind_sources, is_clickable=False, is_shadow=False)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Меню «Белые списки»
+# ════════════════════════════════════════════════════════════════════
+
+def _kv_row(ctx, parent, label):
+    from android.widget import LinearLayout
+
+    row = LinearLayout(ctx)
+    row.setOrientation(0)
+    row.setGravity(16)
+    lab = _text(ctx, label, 14, Theme.getColor(Theme.key_windowBackgroundWhiteGrayText2))
+    row.addView(lab, _lp(0, -2, 1.0))
+    val = _text(ctx, "—", 14, 0, bold=True)
+    val.setGravity(5)
+    row.addView(val, _lp(-2, -2))
+    lp = _lp(-1, -2)
+    lp.setMargins(0, _dp(10), 0, 0)
+    parent.addView(row, lp)
+    return row, val
+
+
+def _create_wl(context, list_view, current_account, class_guid, resources_provider):
+    from android.widget import LinearLayout
+
+    GD = jclass("android.graphics.drawable.GradientDrawable")
+    Orientation = jclass("android.graphics.drawable.GradientDrawable$Orientation")
+    ui = {}
+    black = Theme.getColor(Theme.key_windowBackgroundWhiteBlackText)
+    gray = Theme.getColor(Theme.key_windowBackgroundWhiteGrayText2)
+
+    root = LinearLayout(context)
+    root.setOrientation(1)
+    root.setPadding(_dp(12), _dp(4), _dp(12), _dp(8))
+
+    # карточка «Информация о сети»
+    info = LinearLayout(context)
+    info.setOrientation(1)
+    info.setPadding(_dp(18), _dp(16), _dp(18), _dp(16))
+    info.addView(_text(context, "Информация о сети", 17, black, bold=True), _lp(-2, -2))
+    _, ui["type"] = _kv_row(context, info, "Тип подключения")
+    _, ui["status"] = _kv_row(context, info, "Статус")
+    _, ui["net"] = _kv_row(context, info, "Сеть")
+    ui["vpn_row"], vpn_val = _kv_row(context, info, "VPN")
+    vpn_val.setText("включён — результат неточный")
+    vpn_val.setTextColor(_color(WL_COLORS["warn"]))
+    root.addView(info, _lp(-1, -2))
+    ui["info"] = info
+
+    # круглая кнопка
+    btn = LinearLayout(context)
+    btn.setOrientation(1)
+    btn.setGravity(17)
+    btn.setClickable(True)
+    try:
+        grad = GD(Orientation.TL_BR, jarray(jint)([_color(BRAND_2), _color(BRAND)]))
+    except Exception:
+        grad = GD()
+        grad.setColor(_color(BRAND))
+    grad.setShape(1)  # OVAL
+    btn.setBackground(grad)
+    try:
+        btn.setElevation(float(_dp(6)))
+    except Exception:
+        pass
+    ui["btn_main"] = _text(context, "ТЕСТ", 26, _color(HEADER_TEXT), bold=True)
+    ui["btn_sub"] = _text(context, "Проверка", 13, _color(HEADER_TEXT))
+    btn.addView(ui["btn_main"], _lp(-2, -2))
+    btn.addView(ui["btn_sub"], _lp(-2, -2))
+    btn.setOnClickListener(OnClickListener(lambda _v: _wl_start()))
+    holder = LinearLayout(context)
+    holder.setGravity(1)
+    holder.setPadding(0, _dp(24), 0, _dp(24))
+    holder.addView(btn, _lp(_dp(168), _dp(168)))
+    root.addView(holder, _lp(-1, -2))
+
+    # карточка результата
+    res = LinearLayout(context)
+    res.setOrientation(1)
+    res.setGravity(1)
+    res.setPadding(_dp(16), _dp(16), _dp(16), _dp(16))
+    res.addView(_text(context, "Результат теста", 17, black, bold=True), _lp(-2, -2))
+    pill = _text(context, "", 15, black, bold=True)
+    pill.setGravity(17)
+    pill.setPadding(_dp(16), _dp(12), _dp(16), _dp(12))
+    plp = _lp(-1, -2)
+    plp.setMargins(0, _dp(14), 0, 0)
+    res.addView(pill, plp)
+    ui["pill"] = pill
+    ui["time"] = _text(context, "", 12, gray)
+    tlp = _lp(-2, -2)
+    tlp.setMargins(0, _dp(10), 0, 0)
+    res.addView(ui["time"], tlp)
+
+    tiles_row = LinearLayout(context)
+    tiles_row.setOrientation(0)
+    ui["tiles"], ui["cnt"] = [], []
+    for label in ("Белый список", "Российские", "Нейтральные"):
+        tile = LinearLayout(context)
+        tile.setOrientation(1)
+        tile.setGravity(1)
+        tile.setPadding(_dp(4), _dp(14), _dp(4), _dp(12))
+        cnt = _text(context, "—", 20, black, bold=True)
+        cnt.setClickable(True)
+        cnt.setOnClickListener(OnClickListener(lambda _v, i=len(ui["cnt"]): _wl_show_site_results(i)))
+        tile.addView(cnt, _lp(-2, -2))
+        lab = _text(context, label, 11, gray)
+        lab.setSingleLine(True)
+        tile.addView(lab, _lp(-2, -2))
+        lp = _lp(0, -2, 1.0)
+        lp.setMargins(_dp(3), 0, _dp(3), 0)
+        tiles_row.addView(tile, lp)
+        ui["tiles"].append(tile)
+        ui["cnt"].append(cnt)
+    rlp = _lp(-1, -2)
+    rlp.setMargins(0, _dp(14), 0, 0)
+    res.addView(tiles_row, rlp)
+    root.addView(res, _lp(-1, -2))
+    ui["res"] = res
+
+    _set_row_params(root)
+    ui["root"] = root
+    _WL_UI.clear()
+    _WL_UI.update(ui)
+    return root
+
+
+def _bind_wl(view, item, divider, adapter, list_view):
+    _wl_apply()
+
+
+WL_FACTORY = SimpleSettingFactory(_create_wl, _bind_wl, is_clickable=False, is_shadow=False)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Кнопка «Автопилот» (вкладка «Прокси»)
+# ════════════════════════════════════════════════════════════════════
+
+def _pilot_idle_text():
+    p = _PLUGIN
+    if p is not None:
+        try:
+            last = str(p.get_setting("pilot_last_short", "") or "")
+            if last:
+                return f"Последний запуск {_fmt_time(p.get_setting('pilot_last_ts', 0))} · {last}"
+        except Exception:
+            pass
+    return "Сбор → дубликаты → пинг → очистка → сортировка → подключение"
+
+
+def _pilot_apply():
+    ui = _PILOT_UI
+    if not ui:
+        return
+    try:
+        running = bool(_PILOT["running"])
+        ui["title"].setText("Остановить автопилот" if running else "Запустить автопилот")
+        ui["sub"].setText((_PILOT["text"] or "Работаю…") if running else _pilot_idle_text())
+        total = int(_PILOT["total"] or 0)
+        frac = min(1.0, float(_PILOT["step"]) / total) if (running and total) else 0.0
+        ui["bar"].setVisibility(0 if running else 4)
+        ui["fill"].setLayoutParams(_lp(0, -1, max(frac, 0.001)))
+        ui["rest"].setLayoutParams(_lp(0, -1, max(1.0 - frac, 0.001)))
+    except Exception as e:
+        _log(f"pilot apply: {e}")
+
+
+def _create_pilot(context, list_view, current_account, class_guid, resources_provider):
+    from android.view import View
+    from android.widget import FrameLayout, ImageView, LinearLayout
+
+    GD = jclass("android.graphics.drawable.GradientDrawable")
+    Orientation = jclass("android.graphics.drawable.GradientDrawable$Orientation")
+    Color = jclass("android.graphics.Color")
+    ink = _color(HEADER_TEXT)
+
+    root = LinearLayout(context)
+    root.setOrientation(1)
+    root.setPadding(_dp(12), _dp(8), _dp(12), _dp(4))
+
+    card = LinearLayout(context)
+    card.setOrientation(1)
+    card.setClickable(True)
+    card.setPadding(_dp(18), _dp(16), _dp(18), _dp(16))
+    try:
+        grad = GD(Orientation.TL_BR, jarray(jint)([_color(BRAND_2), _color(BRAND)]))
+    except Exception:
+        grad = _rounded(_color(BRAND), 22)
+    grad.setCornerRadius(float(_dp(22)))
+    card.setBackground(grad)
+
+    top = LinearLayout(context)
+    top.setOrientation(0)
+    top.setGravity(16)  # CENTER_VERTICAL
+
+    badge = FrameLayout(context)
+    circle = GD()
+    circle.setShape(1)  # OVAL
+    circle.setColor(Color.argb(95, 255, 255, 255))
+    badge.setBackground(circle)
+    icon = ImageView(context)
+    rid = _res_id(context, ["msg_retry", "msg_download", "msg_settings"])
+    if rid:
+        icon.setImageResource(rid)
+    icon.setColorFilter(ink)
+    FLP = jclass("android.widget.FrameLayout$LayoutParams")
+    badge.addView(icon, FLP(_dp(26), _dp(26), 17))
+    top.addView(badge, _lp(_dp(50), _dp(50)))
+
+    col = LinearLayout(context)
+    col.setOrientation(1)
+    title = _text(context, "Запустить автопилот", 17, ink, bold=True)
+    sub = _text(context, " ", 12, ink)
+    sub.setAlpha(0.8)
+    sub.setMaxLines(3)
+    col.addView(title, _lp(-2, -2))
+    col.addView(sub, _lp(-2, -2))
+    clp = _lp(0, -2, 1.0)
+    clp.setMargins(_dp(14), 0, 0, 0)
+    top.addView(col, clp)
+    card.addView(top, _lp(-1, -2))
+
+    bar = LinearLayout(context)
+    bar.setOrientation(0)
+    bar.setBackground(_rounded(Color.argb(90, 255, 255, 255), 2))
+    fill = View(context)
+    fill.setBackground(_rounded(ink, 2))
+    rest = View(context)
+    bar.addView(fill, _lp(0, -1, 0.001))
+    bar.addView(rest, _lp(0, -1, 1.0))
+    blp = _lp(-1, _dp(4))
+    blp.setMargins(0, _dp(14), 0, 0)
+    card.addView(bar, blp)
+    bar.setVisibility(4)  # INVISIBLE — место резервируем, чтобы строка не прыгала
+
+    def on_click(_v):
+        if _PLUGIN is not None:
+            _PLUGIN._pilot_toggle()
+
+    card.setOnClickListener(OnClickListener(on_click))
+    try:
+        card.setElevation(float(_dp(3)))
+    except Exception:
+        pass
+
+    root.addView(card, _lp(-1, -2))
+    _set_row_params(root)
+    _PILOT_UI.clear()
+    _PILOT_UI.update({"title": title, "sub": sub, "bar": bar, "fill": fill, "rest": rest})
+    return root
+
+
+def _bind_pilot(view, item, divider, adapter, list_view):
+    _pilot_apply()
+
+
+PILOT_FACTORY = SimpleSettingFactory(_create_pilot, _bind_pilot, is_clickable=False, is_shadow=False)
