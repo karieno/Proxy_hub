@@ -7,8 +7,8 @@ Proxy Hub — плагин для Telegram, который объединяет 
 ## Поддерживаемые сборки
 Плагин работает **только** в следующих проектах:
 
-- AyuGram/AyuGram4A
-- exteraSquad/exteraGram
+- [AyuGram/AyuGram4A](https://github.com/AyuGram/AyuGram4A)
+- [exteraSquad/exteraGram](https://github.com/exteraSquad/exteraGram)
 
 ## Что умеет плагин
 
